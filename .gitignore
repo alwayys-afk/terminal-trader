@@ -1,0 +1,6 @@
+/target
+.env
+schwab_tokens.json
+trader.log
+tax_lots*.json
+app_prefs.json

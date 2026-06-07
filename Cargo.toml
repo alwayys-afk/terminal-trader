@@ -1,0 +1,61 @@
+[workspace]
+members = [".", "schwab-trader", "schwab-marketdata"]
+resolver = "2"
+
+[package]
+name = "terminal-trader"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A terminal (TUI) trading client for the Charles Schwab brokerage API."
+repository = "https://github.com/alwayys-afk/terminal-trader"
+readme = "README.md"
+keywords = ["trading", "schwab", "tui", "finance", "stocks"]
+categories = ["command-line-utilities", "finance"]
+
+[dependencies]
+# Schwab generated clients
+schwab-trader = { path = "schwab-trader" }
+schwab-marketdata = { path = "schwab-marketdata" }
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+reqwest = { version = "0.13", features = ["json", "form"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging (file-based so it doesn't interfere with TUI)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+# CSV parsing
+csv = "1"
+
+# Env / config
+dotenvy = "0.15"
+
+# Auth helpers
+open = "5"
+getrandom = "0.2"
+base64 = "0.22"
+urlencoding = "2"
+
+[dev-dependencies]
