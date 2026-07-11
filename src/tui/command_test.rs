@@ -396,3 +396,142 @@ fn parse_invalid_amount() {
         ParseResult::Invalid(_)
     ));
 }
+
+// ── option grammar ───────────────────────────────────────────────────
+
+use crate::schwab::{ExpirySpec, PutCall};
+
+#[test]
+fn parse_option_full_command() {
+    let ParseResult::Valid(cmd) = parse_command("buy aapl 215c 7/17 1 mid") else {
+        panic!("expected Valid");
+    };
+    assert_eq!(cmd.symbol, "AAPL");
+    let contract = cmd.contract.expect("contract");
+    assert_eq!(contract.strike, 215.0);
+    assert_eq!(contract.side, PutCall::Call);
+    assert_eq!(contract.expiry, ExpirySpec::MonthDay { month: 7, day: 17 });
+    assert_eq!(cmd.amount, Some(Amount::Shares(1.0)));
+    assert_eq!(cmd.modifier, Modifier::Mid);
+}
+
+#[test]
+fn parse_option_fractional_put_lotto() {
+    let ParseResult::Valid(cmd) = parse_command("buy f 12.5p lotto 2") else {
+        panic!("expected Valid");
+    };
+    let contract = cmd.contract.expect("contract");
+    assert_eq!(contract.strike, 12.5);
+    assert_eq!(contract.side, PutCall::Put);
+    assert_eq!(contract.expiry, ExpirySpec::Lotto);
+    assert_eq!(cmd.amount, Some(Amount::Shares(2.0)));
+}
+
+#[test]
+fn parse_option_month_monthly() {
+    let ParseResult::Valid(cmd) = parse_command("sell spy 640c july monthly 1 ask") else {
+        panic!("expected Valid");
+    };
+    let contract = cmd.contract.expect("contract");
+    assert_eq!(contract.expiry, ExpirySpec::MonthMonthly(7));
+    assert_eq!(cmd.modifier, Modifier::Ask);
+}
+
+#[test]
+fn parse_option_next_week() {
+    let ParseResult::Valid(cmd) = parse_command("buy nvda 190c next week 1") else {
+        panic!("expected Valid");
+    };
+    assert_eq!(cmd.contract.unwrap().expiry, ExpirySpec::NextWeek);
+    assert_eq!(cmd.amount, Some(Amount::Shares(1.0)));
+}
+
+#[test]
+fn parse_option_explicit_dates() {
+    let ParseResult::Valid(cmd) = parse_command("buy nvda 190c 7/17/27") else {
+        panic!("expected Valid");
+    };
+    let expected = chrono::NaiveDate::from_ymd_opt(2027, 7, 17).unwrap();
+    assert_eq!(cmd.contract.unwrap().expiry, ExpirySpec::Date(expected));
+
+    let ParseResult::Valid(cmd) = parse_command("buy nvda 190c 2027-07-17 1") else {
+        panic!("expected Valid");
+    };
+    assert_eq!(cmd.contract.unwrap().expiry, ExpirySpec::Date(expected));
+}
+
+#[test]
+fn parse_option_incomplete_forms() {
+    // Contract without an expiration isn't submittable yet.
+    assert!(matches!(
+        parse_command("buy aapl 215c"),
+        ParseResult::Incomplete
+    ));
+    // "next" and a month name wait for their second token.
+    assert!(matches!(
+        parse_command("buy aapl 215c next"),
+        ParseResult::Incomplete
+    ));
+    assert!(matches!(
+        parse_command("buy aapl 215c may"),
+        ParseResult::Incomplete
+    ));
+}
+
+#[test]
+fn parse_option_expiry_errors() {
+    assert!(matches!(
+        parse_command("buy aapl 215c bogus"),
+        ParseResult::Invalid(_)
+    ));
+    // "ju" could be june or july.
+    assert!(matches!(
+        parse_command("buy aapl 215c ju"),
+        ParseResult::Ambiguous(_)
+    ));
+    // A month name must be followed by "monthly".
+    assert!(matches!(
+        parse_command("buy aapl 215c may 15"),
+        ParseResult::Invalid(_)
+    ));
+}
+
+#[test]
+fn parse_option_percent_rules_match_equity() {
+    assert!(matches!(
+        parse_command("sell aapl 215c 7/17 50%"),
+        ParseResult::Valid(_)
+    ));
+    assert!(matches!(
+        parse_command("buy aapl 215c 7/17 50%"),
+        ParseResult::Invalid(_)
+    ));
+}
+
+#[test]
+fn parse_plain_number_amount_stays_equity() {
+    // "215" with no side suffix is a share count, not a strike.
+    let ParseResult::Valid(cmd) = parse_command("buy aapl 215") else {
+        panic!("expected Valid");
+    };
+    assert!(cmd.contract.is_none());
+    assert_eq!(cmd.amount, Some(Amount::Shares(215.0)));
+}
+
+#[test]
+fn token_focus_option_layout() {
+    assert_eq!(token_focus("buy aapl 215c", 13), TokenFocus::Contract);
+    assert_eq!(token_focus("buy aapl 215c ", 14), TokenFocus::Expiry);
+    assert_eq!(token_focus("buy aapl 215c 7/17 ", 19), TokenFocus::Amount);
+    assert_eq!(token_focus("buy aapl 215c next ", 19), TokenFocus::Expiry);
+    assert_eq!(
+        token_focus("buy aapl 215c next week ", 24),
+        TokenFocus::Amount
+    );
+    assert_eq!(
+        token_focus("buy aapl 215c july monthly 1 ", 29),
+        TokenFocus::Modifier
+    );
+    // Equity layout is unchanged.
+    assert_eq!(token_focus("buy AAPL 10 ", 12), TokenFocus::Modifier);
+}

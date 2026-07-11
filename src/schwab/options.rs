@@ -17,13 +17,19 @@ pub enum PutCall {
     Put,
 }
 
-/// How an expiration is classified by the OCC (drives monthly/weekly filters).
+/// How an expiration is classified (drives monthly/weekly filters).
+///
+/// Schwab's letters don't mean what they look like: `S` ("standard") is the
+/// classic 3rd-Friday monthly, while `M` is the *end-of-month* expiration.
+/// Verified against live chain data — the 3rd-Friday dates come back `S`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpiryKind {
     Weekly,
+    /// Standard 3rd-Friday expiration (Schwab type `S`) — what "monthly" means.
     Monthly,
     Quarterly,
-    /// Anything else the exchange reports (e.g. EOM/standard "S").
+    /// End-of-month expiration (Schwab type `M`).
+    EndOfMonth,
     Other,
 }
 
@@ -31,9 +37,10 @@ impl ExpiryKind {
     fn from_api(t: Option<md::ExpirationType>) -> ExpiryKind {
         match t {
             Some(md::ExpirationType::W) => ExpiryKind::Weekly,
-            Some(md::ExpirationType::M) => ExpiryKind::Monthly,
+            Some(md::ExpirationType::S) => ExpiryKind::Monthly,
             Some(md::ExpirationType::Q) => ExpiryKind::Quarterly,
-            Some(md::ExpirationType::S) | None => ExpiryKind::Other,
+            Some(md::ExpirationType::M) => ExpiryKind::EndOfMonth,
+            None => ExpiryKind::Other,
         }
     }
 }
@@ -100,6 +107,18 @@ pub struct ExpirationSlice {
     pub puts: Vec<OptionContract>,
 }
 
+impl ExpirationSlice {
+    /// The expiration's classification, taken from any contract in the slice
+    /// (all contracts of one expiration share it).
+    pub fn kind(&self) -> ExpiryKind {
+        self.calls
+            .first()
+            .or_else(|| self.puts.first())
+            .map(|c| c.expiry_kind)
+            .unwrap_or(ExpiryKind::Other)
+    }
+}
+
 /// A flattened option chain for one underlying.
 #[derive(Debug, Clone)]
 pub struct OptionChainSnapshot {
@@ -135,6 +154,120 @@ impl OptionChainSnapshot {
             .map(|s| s.calls.len() + s.puts.len())
             .sum()
     }
+}
+
+// ── Contract specs (typed commands / chain filters) ──────────────────────────
+
+/// Which expiration an option command refers to. Relative forms (everything
+/// but explicit dates) resolve against the underlying's chain via
+/// [`resolve_expiry`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExpirySpec {
+    /// `7/17` — the next occurrence of that month/day.
+    MonthDay { month: u32, day: u32 },
+    /// `7/17/27` or `2027-07-17` — an explicit date.
+    Date(NaiveDate),
+    /// `lotto` — the nearest expiration in the chain.
+    Lotto,
+    /// `weekly` — the nearest weekly expiration.
+    Weekly,
+    /// `monthly` — the nearest standard (3rd-Friday) monthly expiration.
+    Monthly,
+    /// `next week` — the last expiration within next calendar week.
+    NextWeek,
+    /// `july monthly` — the standard monthly expiration of that month (1-12).
+    MonthMonthly(u32),
+}
+
+/// A single option contract in a typed command: `215c 7/17` after the symbol.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContractSpec {
+    pub strike: f64,
+    pub side: PutCall,
+    pub expiry: ExpirySpec,
+}
+
+/// Resolve an expiration spec to a concrete date. Explicit dates resolve on
+/// their own; relative forms search the chain (`Err` with a human-readable
+/// reason when the chain isn't loaded yet or has no matching expiration).
+pub fn resolve_expiry(
+    spec: ExpirySpec,
+    chain: Option<&OptionChainSnapshot>,
+    today: NaiveDate,
+) -> Result<NaiveDate, String> {
+    use chrono::Datelike;
+
+    match spec {
+        ExpirySpec::Date(d) => {
+            if d < today {
+                return Err(format!("{} is in the past", d.format("%-m/%-d/%y")));
+            }
+            Ok(d)
+        }
+        ExpirySpec::MonthDay { month, day } => {
+            // Next occurrence: this year if not already past, otherwise next.
+            for year in [today.year(), today.year() + 1] {
+                if let Some(d) = NaiveDate::from_ymd_opt(year, month, day)
+                    && d >= today
+                {
+                    return Ok(d);
+                }
+            }
+            Err(format!("no upcoming {month}/{day}"))
+        }
+        relative => {
+            let chain = chain.ok_or("loading option chain...")?;
+            let mut future = chain.expirations.range(today..);
+            match relative {
+                ExpirySpec::Lotto => future
+                    .next()
+                    .map(|(d, _)| *d)
+                    .ok_or_else(|| "no expirations in chain".to_string()),
+                ExpirySpec::Weekly => future
+                    .find(|(_, s)| s.kind() == ExpiryKind::Weekly)
+                    .map(|(d, _)| *d)
+                    .ok_or_else(|| "no weekly expiration in chain".to_string()),
+                ExpirySpec::Monthly => future
+                    .find(|(_, s)| s.kind() == ExpiryKind::Monthly)
+                    .map(|(d, _)| *d)
+                    .ok_or_else(|| "no monthly expiration in chain".to_string()),
+                ExpirySpec::NextWeek => {
+                    // Next calendar week (Mon..=Sun); take its last expiration
+                    // (typically the Friday weekly).
+                    let days_to_next_monday = 7 - today.weekday().num_days_from_monday() as i64 % 7;
+                    let monday = today + chrono::Duration::days(days_to_next_monday);
+                    let sunday = monday + chrono::Duration::days(6);
+                    chain
+                        .expirations
+                        .range(monday..=sunday)
+                        .next_back()
+                        .map(|(d, _)| *d)
+                        .ok_or_else(|| "no expiration next week".to_string())
+                }
+                ExpirySpec::MonthMonthly(month) => future
+                    .find(|(d, s)| d.month() == month && s.kind() == ExpiryKind::Monthly)
+                    .map(|(d, _)| *d)
+                    .ok_or_else(|| format!("no monthly expiration for month {month} in chain")),
+                // Date/MonthDay handled above.
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+/// Look up a contract in the chain by expiration date, side, and strike.
+pub fn find_contract(
+    chain: &OptionChainSnapshot,
+    expiration: NaiveDate,
+    side: PutCall,
+    strike: f64,
+) -> Option<&OptionContract> {
+    let slice = chain.expirations.get(&expiration)?;
+    let contracts = match side {
+        PutCall::Call => &slice.calls,
+        PutCall::Put => &slice.puts,
+    };
+    contracts.iter().find(|c| (c.strike - strike).abs() < 1e-9)
 }
 
 // ── OSI symbols ───────────────────────────────────────────────────────────────
@@ -381,6 +514,96 @@ mod tests {
             1,
             "the field-less contract is skipped"
         );
+    }
+
+    /// Build a one-contract slice with the given kind for resolver tests.
+    fn slice(kind: ExpiryKind, expiration: NaiveDate) -> ExpirationSlice {
+        ExpirationSlice {
+            calls: vec![OptionContract {
+                osi_symbol: format!("TEST  {}C00100000", expiration.format("%y%m%d")),
+                strike: 100.0,
+                expiration,
+                put_call: PutCall::Call,
+                expiry_kind: kind,
+                bid: 1.0,
+                ask: 1.2,
+                mark: 1.1,
+                last: 1.1,
+                delta: 0.5,
+                theta: -0.02,
+                iv: 30.0,
+                open_interest: 10,
+                volume: 5,
+                days_to_exp: 5,
+                in_the_money: false,
+            }],
+            puts: vec![],
+        }
+    }
+
+    fn test_chain() -> OptionChainSnapshot {
+        let d = |y, m, dd| NaiveDate::from_ymd_opt(y, m, dd).unwrap();
+        let mut expirations = BTreeMap::new();
+        expirations.insert(d(2026, 7, 13), slice(ExpiryKind::Weekly, d(2026, 7, 13)));
+        expirations.insert(d(2026, 7, 17), slice(ExpiryKind::Monthly, d(2026, 7, 17)));
+        expirations.insert(d(2026, 7, 20), slice(ExpiryKind::Weekly, d(2026, 7, 20)));
+        expirations.insert(d(2026, 8, 21), slice(ExpiryKind::Monthly, d(2026, 8, 21)));
+        OptionChainSnapshot {
+            underlying: "TEST".to_string(),
+            underlying_price: 100.0,
+            expirations,
+        }
+    }
+
+    #[test]
+    fn resolve_expiry_relative_forms() {
+        let chain = test_chain();
+        // Friday 2026-07-10; nearest expiration is Monday 7/13.
+        let today = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let d = |y, m, dd| NaiveDate::from_ymd_opt(y, m, dd).unwrap();
+
+        let resolve = |spec| resolve_expiry(spec, Some(&chain), today);
+        assert_eq!(resolve(ExpirySpec::Lotto), Ok(d(2026, 7, 13)));
+        assert_eq!(resolve(ExpirySpec::Weekly), Ok(d(2026, 7, 13)));
+        assert_eq!(resolve(ExpirySpec::Monthly), Ok(d(2026, 7, 17)));
+        // Next calendar week is Mon 7/13 – Sun 7/19; its last expiration is 7/17.
+        assert_eq!(resolve(ExpirySpec::NextWeek), Ok(d(2026, 7, 17)));
+        assert_eq!(resolve(ExpirySpec::MonthMonthly(8)), Ok(d(2026, 8, 21)));
+        assert_eq!(resolve(ExpirySpec::MonthMonthly(7)), Ok(d(2026, 7, 17)));
+        assert!(resolve(ExpirySpec::MonthMonthly(9)).is_err());
+    }
+
+    #[test]
+    fn resolve_expiry_dates_without_chain() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let d = |y, m, dd| NaiveDate::from_ymd_opt(y, m, dd).unwrap();
+
+        // Explicit dates never need the chain.
+        assert_eq!(
+            resolve_expiry(ExpirySpec::Date(d(2026, 7, 17)), None, today),
+            Ok(d(2026, 7, 17))
+        );
+        assert!(resolve_expiry(ExpirySpec::Date(d(2026, 7, 9)), None, today).is_err());
+        // Month/day picks the next occurrence, rolling into next year if past.
+        assert_eq!(
+            resolve_expiry(ExpirySpec::MonthDay { month: 7, day: 17 }, None, today),
+            Ok(d(2026, 7, 17))
+        );
+        assert_eq!(
+            resolve_expiry(ExpirySpec::MonthDay { month: 1, day: 15 }, None, today),
+            Ok(d(2027, 1, 15))
+        );
+        // Relative forms report the chain as still loading.
+        assert!(resolve_expiry(ExpirySpec::Lotto, None, today).is_err());
+    }
+
+    #[test]
+    fn find_contract_matches_side_and_strike() {
+        let chain = test_chain();
+        let d = NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        assert!(find_contract(&chain, d, PutCall::Call, 100.0).is_some());
+        assert!(find_contract(&chain, d, PutCall::Put, 100.0).is_none());
+        assert!(find_contract(&chain, d, PutCall::Call, 105.0).is_none());
     }
 
     #[test]

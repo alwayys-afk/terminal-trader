@@ -485,7 +485,7 @@ mod tests {
     /// service name and request id onto the wire.
     #[test]
     fn level_one_subscribe_includes_fields_unsubscribe_omits_them() {
-        let keys = vec!["AAPL".to_string()];
+        let keys = ["AAPL".to_string()];
 
         let subs = StreamerRequest::subscribe(LevelOneFeed::Equities, "cust", "corr", keys.iter());
         let v = serde_json::to_value(&subs.requests[0]).unwrap();

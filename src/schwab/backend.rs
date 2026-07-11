@@ -149,10 +149,10 @@ impl DataService {
             self.save_and_send().await;
         }
 
-        // Temporary command-bar symbols are equity-only for now (the option
-        // chain view in a later phase will add option command symbols).
-        let mut cmd_symbols: HashSet<String> = HashSet::new();
-        // Currently-subscribed symbols per feed. Equities also fold in cmd_symbols.
+        // Temporary command-bar symbols (quote previews while typing). OSI
+        // symbols route to the options feed, everything else to equities.
+        let mut cmd_syms = FeedSymbols::default();
+        // Currently-subscribed symbols per feed, commands folded in.
         let mut eq_symbols: HashSet<String> = &pos.equities | &ord.equities;
         let mut opt_symbols: HashSet<String> = &pos.options | &ord.options;
         info!(
@@ -275,7 +275,7 @@ impl DataService {
                                 self.lot_store.rebuild();
                                 self.save_and_send().await;
                             }
-                            let new_eq = &(&pos.equities | &ord.equities) | &cmd_symbols;
+                            let new_eq = &(&pos.equities | &ord.equities) | &cmd_syms.equities;
                             if new_eq != eq_symbols {
                                 info!("data_service: equity symbol set changed to {new_eq:?}");
                                 eq_symbols = new_eq;
@@ -283,7 +283,7 @@ impl DataService {
                                     stream.subscribe(LevelOneFeed::Equities, &eq_symbols).await?;
                                 }
                             }
-                            let new_opt = &pos.options | &ord.options;
+                            let new_opt = &(&pos.options | &ord.options) | &cmd_syms.options;
                             resync_option_subs(&mut stream, &mut opt_symbols, new_opt).await?;
                         }
                     }
@@ -364,37 +364,84 @@ impl DataService {
                             });
                         }
                         AppCommand::SubscribeToQuote(sym) => {
-                            if cmd_symbols.insert(sym.clone()) {
-                                info!("data_service: subscribing command symbol {sym}");
-                                let new_eq = &(&pos.equities | &ord.equities) | &cmd_symbols;
-                                if new_eq != eq_symbols {
-                                    eq_symbols = new_eq;
-                                    if !eq_symbols.is_empty() {
-                                        stream.subscribe(LevelOneFeed::Equities, &eq_symbols).await?;
+                            // OSI-shaped symbols are option contracts; route by format
+                            // since the command bar has no instrument metadata.
+                            let asset_type = if crate::schwab::OsiSymbol::parse(&sym).is_some() {
+                                AssetType::Option
+                            } else {
+                                AssetType::Equity
+                            };
+                            let inserted = if asset_type == AssetType::Option {
+                                cmd_syms.options.insert(sym.clone())
+                            } else {
+                                cmd_syms.equities.insert(sym.clone())
+                            };
+                            if inserted {
+                                info!("data_service: subscribing command symbol {sym} ({asset_type:?})");
+                                if asset_type == AssetType::Option {
+                                    let new_opt = &(&pos.options | &ord.options) | &cmd_syms.options;
+                                    resync_option_subs(&mut stream, &mut opt_symbols, new_opt).await?;
+                                } else {
+                                    let new_eq = &(&pos.equities | &ord.equities) | &cmd_syms.equities;
+                                    if new_eq != eq_symbols {
+                                        eq_symbols = new_eq;
+                                        if !eq_symbols.is_empty() {
+                                            stream.subscribe(LevelOneFeed::Equities, &eq_symbols).await?;
+                                        }
                                     }
                                 }
                             }
                         }
 
                         AppCommand::ClearCmdSymbols => {
-                            let base = &pos.equities | &ord.equities;
-                            let to_remove: HashSet<String> = &cmd_symbols - &base;
-                            cmd_symbols.clear();
-                            if !to_remove.is_empty() {
-                                info!("data_service: unsubscribing command symbols {:?}", to_remove);
-                                for s in &to_remove {
+                            let eq_remove: HashSet<String> = &cmd_syms.equities - &(&pos.equities | &ord.equities);
+                            cmd_syms.equities.clear();
+                            if !eq_remove.is_empty() {
+                                info!("data_service: unsubscribing command symbols {eq_remove:?}");
+                                for s in &eq_remove {
                                     quotes_cache.remove(s);
                                     eq_symbols.remove(s);
                                 }
-                                stream.unsubscribe(LevelOneFeed::Equities, &to_remove).await?;
+                                stream.unsubscribe(LevelOneFeed::Equities, &eq_remove).await?;
+                            }
+                            let opt_remove: HashSet<String> = &cmd_syms.options - &(&pos.options | &ord.options);
+                            cmd_syms.options.clear();
+                            if !opt_remove.is_empty() {
+                                for s in &opt_remove {
+                                    quotes_cache.remove(s);
+                                }
+                                let new_opt = &opt_symbols - &opt_remove;
+                                resync_option_subs(&mut stream, &mut opt_symbols, new_opt).await?;
                             }
                         }
-                        AppCommand::PlaceOrder { symbol, instruction, quantity, limit_price, tax_lot_method } => {
+
+                        AppCommand::FetchOptionChain { underlying } => {
+                            let client2 = client.clone();
+                            let tx2 = self.tx.clone();
+                            tokio::spawn(async move {
+                                match client2.get_option_chain(&underlying).await {
+                                    Ok(chain) => {
+                                        tx2.send(DataMsg::OptionChain {
+                                            underlying,
+                                            chain: Box::new(chain),
+                                        })
+                                        .await
+                                        .ok();
+                                    }
+                                    Err(e) => {
+                                        tx2.send(DataMsg::Error(format!("chain {underlying}: {e}")))
+                                            .await
+                                            .ok();
+                                    }
+                                }
+                            });
+                        }
+                        AppCommand::PlaceOrder { symbol, asset_type, instruction, quantity, limit_price, tax_lot_method } => {
                             let client2 = client.clone();
                             let tx2 = self.tx.clone();
                             let acct = self.account_hash.clone();
                             tokio::spawn(async move {
-                                let spec = InstrumentSpec::Equity { symbol };
+                                let spec = instrument_spec_for(symbol, asset_type);
                                 let api_method = tax_lot_method.map(|m| m.to_api_method());
                                 let result = client2
                                     .place_order(&acct, spec, instruction, quantity, limit_price, api_method)
@@ -415,12 +462,12 @@ impl DataService {
                                 tx2.send(DataMsg::OrderResult("Order canceled".to_string(), result)).await.ok();
                             });
                         }
-                        AppCommand::ReplaceOrder { order_id, symbol, instruction, quantity, limit_price, tax_lot_method } => {
+                        AppCommand::ReplaceOrder { order_id, symbol, asset_type, instruction, quantity, limit_price, tax_lot_method } => {
                             let client2 = client.clone();
                             let tx2 = self.tx.clone();
                             let acct = self.account_hash.clone();
                             tokio::spawn(async move {
-                                let spec = InstrumentSpec::Equity { symbol };
+                                let spec = instrument_spec_for(symbol, asset_type);
                                 let api_method = tax_lot_method.map(|m| m.to_api_method());
                                 let result = client2
                                     .replace_order(&acct, order_id, spec, instruction, quantity, limit_price, api_method)
@@ -635,6 +682,15 @@ impl DataService {
                 tracing::error!("failed to save tax lots to {path}: {e}");
             }
         });
+    }
+}
+
+/// Build the order-instrument spec for a TUI-submitted order.
+fn instrument_spec_for(symbol: String, asset_type: AssetType) -> InstrumentSpec {
+    if asset_type == AssetType::Option {
+        InstrumentSpec::Option { osi_symbol: symbol }
+    } else {
+        InstrumentSpec::Equity { symbol }
     }
 }
 

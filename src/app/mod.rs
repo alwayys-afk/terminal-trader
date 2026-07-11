@@ -8,10 +8,11 @@ use self::lots::TaxLotStore;
 use chrono::NaiveDate;
 
 use crate::schwab::{
-    AccountInfo, AccountSummary, DataService, Instruction, LotSelectionMethod, Order, Position,
-    Quote, SchwabAuth, SchwabClient, SellLeg, TaxLot, is_long_term,
+    AccountInfo, AccountSummary, AssetType, DataService, Instruction, LotSelectionMethod,
+    OptionChainSnapshot, Order, OsiSymbol, Position, Quote, SchwabAuth, SchwabClient, SellLeg,
+    TaxLot, find_contract, is_long_term, resolve_expiry,
 };
-use crate::tui::command::{CommandMode, ListNav};
+use crate::tui::command::{CommandMode, ListNav, ParsedCommand};
 
 pub mod lots;
 pub mod operations;
@@ -52,6 +53,11 @@ pub enum DataMsg {
         symbol: String,
         description: String,
     },
+    /// A fetched option chain snapshot for one underlying.
+    OptionChain {
+        underlying: String,
+        chain: Box<OptionChainSnapshot>,
+    },
     /// Backend has switched to a new account. TUI clears stale per-account state
     /// (positions, orders, account info, quotes) and updates the active hash;
     /// fresh data arrives via subsequent Positions/Orders/AccountInfo messages.
@@ -77,13 +83,20 @@ pub enum AppCommand {
         projection: schwab_marketdata::types::GetInstrumentsProjection,
     },
     ClearCmdSymbols,
+    /// Fetch the option chain for an underlying (background task; the snapshot
+    /// arrives as DataMsg::OptionChain).
+    FetchOptionChain {
+        underlying: String,
+    },
     PlaceOrder {
+        /// Equity ticker or OSI option symbol, per `asset_type`.
         symbol: String,
+        asset_type: AssetType,
         instruction: Instruction,
         quantity: f64,
         limit_price: Option<f64>,
         /// Tax lot selection method for sells (auto-selected per leg). `None`
-        /// for buys or when no lots are tracked.
+        /// for buys, options, or when no lots are tracked.
         tax_lot_method: Option<LotSelectionMethod>,
     },
     CancelOrder {
@@ -92,6 +105,7 @@ pub enum AppCommand {
     ReplaceOrder {
         order_id: i64,
         symbol: String,
+        asset_type: AssetType,
         instruction: Instruction,
         quantity: f64,
         limit_price: Option<f64>,
@@ -344,6 +358,8 @@ pub struct AppState {
     pub current_account: String,
     /// Account picker overlay state, when open.
     pub account_picker: Option<AccountPickerState>,
+    /// Cached option chain snapshots by underlying, with fetch time.
+    pub chains: HashMap<String, (OptionChainSnapshot, Instant)>,
 }
 
 impl AppState {
@@ -370,7 +386,56 @@ impl AppState {
             accounts,
             current_account,
             account_picker: None,
+            chains: HashMap::new(),
         }
+    }
+
+    /// Resolve a typed contract spec to its OSI symbol using cached chains.
+    /// `None` for equity commands; `Some(Err)` while the chain is still
+    /// loading (relative expiries) or the spec can't resolve.
+    pub fn resolve_contract(&self, cmd: &ParsedCommand) -> Option<Result<OsiSymbol, String>> {
+        let contract = cmd.contract.as_ref()?;
+        let chain = self.chains.get(&cmd.symbol).map(|(c, _)| c);
+        let today = chrono::Local::now().date_naive();
+        Some(
+            resolve_expiry(contract.expiry, chain, today).map(|expiration| OsiSymbol {
+                underlying: cmd.symbol.clone(),
+                expiration,
+                put_call: contract.side,
+                strike: contract.strike,
+            }),
+        )
+    }
+
+    /// Best-available quote for an option contract: live stream ticks first,
+    /// falling back to the chain snapshot's prices until the stream catches up.
+    pub fn quote_for_contract(&self, osi: &OsiSymbol) -> Option<Quote> {
+        let osi_str = osi.to_osi_string();
+        if let Some(q) = self.stream.quotes.get(&osi_str)
+            && (q.bid_price > 0.0 || q.ask_price > 0.0)
+        {
+            return Some(q.clone());
+        }
+        let (chain, _) = self.chains.get(&osi.underlying)?;
+        let c = find_contract(chain, osi.expiration, osi.put_call, osi.strike)?;
+        Some(Quote {
+            symbol: osi_str,
+            last_price: c.last,
+            close_price: 0.0,
+            bid_price: c.bid,
+            ask_price: c.ask,
+            bid_size: 0,
+            ask_size: 0,
+            open_price: 0.0,
+            high_price: 0.0,
+            low_price: 0.0,
+            net_change: 0.0,
+            net_percent_change: 0.0,
+            volume: c.volume,
+            mark: c.mark,
+            week_52_high: 0.0,
+            week_52_low: 0.0,
+        })
     }
 
     /// Look up the full AccountSummary for the active account.
@@ -595,6 +660,9 @@ impl AppState {
                         &mut self.word_index,
                     );
                 }
+            }
+            DataMsg::OptionChain { underlying, chain } => {
+                self.chains.insert(underlying, (*chain, Instant::now()));
             }
             DataMsg::AccountSwitched { hash } => {
                 self.current_account = hash;

@@ -80,7 +80,11 @@ pub fn render_command_box(f: &mut Frame, state: &AppState) {
             // Contextual hint for the current token.
             let hint_text = match token_focus(&ts.input, ts.cursor) {
                 TokenFocus::Verb => "buy · sell",
-                TokenFocus::Symbol if !ts.autocomplete.has_suggestions() => "ticker symbol",
+                TokenFocus::Symbol if !ts.autocomplete.has_suggestions() => {
+                    "ticker symbol (add 215c for options)"
+                }
+                TokenFocus::Contract => "strike + side: 215c · 12.5p",
+                TokenFocus::Expiry => "7/17 · lotto · weekly · monthly · next week · july monthly",
                 TokenFocus::Amount => "10 shares · $500 dollars · 50% (sell only)",
                 TokenFocus::Modifier => "mid(default) · market · now · bid · ask · $price",
                 _ => "",
@@ -103,22 +107,56 @@ pub fn render_command_box(f: &mut Frame, state: &AppState) {
             ) {
                 CommandBoxDisplay::QuotePreview => {
                     if let ParseResult::Valid(ref cmd) = ts.parsed {
-                        if let Some(q) = state.stream.quotes.get(&cmd.symbol) {
-                            let held_qty = state.positions.held_qty(&cmd.symbol);
-                            render_typing_preview(
-                                f,
-                                &chunks,
-                                cmd,
-                                q,
-                                held_qty,
-                                &state.account_info,
-                            );
-                        } else {
-                            let fetching = Line::from(Span::styled(
-                                format!("  Fetching quote for {}...", cmd.symbol),
-                                Style::default().fg(Color::DarkGray),
-                            ));
-                            f.render_widget(Paragraph::new(fetching), chunks[2]);
+                        let dim = Style::default().fg(Color::DarkGray);
+                        match state.resolve_contract(cmd) {
+                            // Option command with a resolved contract.
+                            Some(Ok(osi)) => {
+                                if let Some(q) = state.quote_for_contract(&osi) {
+                                    let held_qty = state.positions.held_qty(&osi.to_osi_string());
+                                    render_typing_preview(
+                                        f,
+                                        &chunks,
+                                        cmd,
+                                        &q,
+                                        held_qty,
+                                        &state.account_info,
+                                        Some(&osi),
+                                    );
+                                } else {
+                                    let today = chrono::Local::now().date_naive();
+                                    let fetching = Line::from(Span::styled(
+                                        format!("  Fetching quote for {}...", osi.display(today)),
+                                        dim,
+                                    ));
+                                    f.render_widget(Paragraph::new(fetching), chunks[2]);
+                                }
+                            }
+                            // Option command still waiting on the chain (or unresolvable).
+                            Some(Err(reason)) => {
+                                let line = Line::from(Span::styled(format!("  {reason}"), dim));
+                                f.render_widget(Paragraph::new(line), chunks[2]);
+                            }
+                            // Equity command.
+                            None => {
+                                if let Some(q) = state.stream.quotes.get(&cmd.symbol) {
+                                    let held_qty = state.positions.held_qty(&cmd.symbol);
+                                    render_typing_preview(
+                                        f,
+                                        &chunks,
+                                        cmd,
+                                        q,
+                                        held_qty,
+                                        &state.account_info,
+                                        None,
+                                    );
+                                } else {
+                                    let fetching = Line::from(Span::styled(
+                                        format!("  Fetching quote for {}...", cmd.symbol),
+                                        dim,
+                                    ));
+                                    f.render_widget(Paragraph::new(fetching), chunks[2]);
+                                }
+                            }
                         }
                     }
                 }
@@ -137,6 +175,7 @@ pub fn render_command_box(f: &mut Frame, state: &AppState) {
         CommandMode::Confirming {
             cmd,
             price,
+            osi,
             replace_order_id,
             ..
         } => {
@@ -173,11 +212,30 @@ pub fn render_command_box(f: &mut Frame, state: &AppState) {
                 Verb::Sell => Color::Red,
             };
 
-            let held_qty = state.positions.held_qty(&cmd.symbol);
+            // Options confirm against the resolved contract: compact name,
+            // open/close tag, and real (×100) notional.
+            let (display_symbol, held_key, multiplier) = match osi {
+                Some(osi) => (
+                    osi.display(chrono::Local::now().date_naive()),
+                    osi.to_osi_string(),
+                    100.0,
+                ),
+                None => (cmd.symbol.clone(), cmd.symbol.clone(), 1.0),
+            };
+            let held_qty = state.positions.held_qty(&held_key);
             let shares = compute_confirmed_shares(cmd, price, held_qty);
             let order_type_str = match &cmd.modifier {
                 Modifier::Market => "MARKET".to_string(),
                 _ => format!("LIMIT @ ${price:.2}"),
+            };
+            // Mirror the instruction the confirm handler will send, so a
+            // naked short (sell with nothing held) is never silent.
+            let effect = match (osi.is_some(), &cmd.verb) {
+                (true, Verb::Buy) if held_qty.unwrap_or(0.0) < 0.0 => "  (to close)",
+                (true, Verb::Buy) => "  (to open)",
+                (true, Verb::Sell) if held_qty.unwrap_or(0.0) > 0.0 => "  (to close)",
+                (true, Verb::Sell) => "  (to OPEN — naked)",
+                _ => "",
             };
 
             let order_line = Line::from(vec![
@@ -188,12 +246,13 @@ pub fn render_command_box(f: &mut Frame, state: &AppState) {
                         .fg(verb_color)
                         .add_modifier(StyleModifier::BOLD),
                 ),
-                Span::raw(format!(" {shares:.0} {}  {order_type_str}", cmd.symbol)),
+                Span::raw(format!(" {shares:.0} {display_symbol}  {order_type_str}")),
+                Span::styled(effect, Style::default().fg(Color::Yellow)),
             ]);
             f.render_widget(Paragraph::new(order_line), chunks[0]);
 
             let mut est_spans = vec![Span::styled(
-                format!("  (~${:.0})", shares * price),
+                format!("  (~${:.0})", shares * price * multiplier),
                 Style::default().fg(Color::DarkGray),
             )];
             if let Some(info) = &state.account_info {
@@ -207,9 +266,10 @@ pub fn render_command_box(f: &mut Frame, state: &AppState) {
             }
             f.render_widget(Paragraph::new(Line::from(est_spans)), chunks[1]);
 
-            // For sells, show the auto-selected tax lot method(s). A sale that
-            // spans long-term and short-term lots splits into two orders.
-            if cmd.verb == Verb::Sell {
+            // For equity sells, show the auto-selected tax lot method(s). A
+            // sale spanning long-term and short-term lots splits into two
+            // orders. Options are excluded from lot tracking — no method.
+            if cmd.verb == Verb::Sell && osi.is_none() {
                 let legs =
                     crate::app::compute_sell_legs(state.lot_store.lots_for(&cmd.symbol), shares);
                 let mut spans = vec![Span::styled(
@@ -291,10 +351,18 @@ fn render_typing_preview(
     q: &Quote,
     held_qty: Option<f64>,
     account_info: &Option<crate::schwab::AccountInfo>,
+    contract: Option<&crate::schwab::OsiSymbol>,
 ) {
+    // Options quote per-contract but settle 100 shares per contract; the
+    // dollar estimate and $-amount sizing use the real notional.
+    let multiplier = if contract.is_some() { 100.0 } else { 1.0 };
+    let label = match contract {
+        Some(osi) => osi.display(chrono::Local::now().date_naive()),
+        None => q.symbol.clone(),
+    };
     let mut quote_spans = vec![
         Span::styled(
-            format!("  {}   ", q.symbol),
+            format!("  {label}   "),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(StyleModifier::BOLD),
@@ -346,6 +414,11 @@ fn render_typing_preview(
     let shares_str = shares
         .map(|s| format!("{s:.0}"))
         .unwrap_or_else(|| "?".to_string());
+    let unit = if contract.is_some() {
+        "contracts"
+    } else {
+        "shares"
+    };
 
     let order_line = Line::from(vec![
         Span::raw("  "),
@@ -355,13 +428,13 @@ fn render_typing_preview(
                 .fg(verb_color)
                 .add_modifier(StyleModifier::BOLD),
         ),
-        Span::raw(format!(" {shares_str} shares  {order_type_str}")),
+        Span::raw(format!(" {shares_str} {unit}  {order_type_str}")),
     ]);
     f.render_widget(Paragraph::new(order_line), chunks[3]);
 
     if let (Some(s), Some(lp)) = (shares, limit_price) {
         let mut est_spans = vec![Span::styled(
-            format!("  (~${:.0})", s * lp),
+            format!("  (~${:.0})", s * lp * multiplier),
             Style::default().fg(Color::DarkGray),
         )];
         if let Some(info) = account_info {
@@ -377,7 +450,14 @@ fn render_typing_preview(
     }
 }
 
-/// Returns `(shares, limit_price)` for the Typing-state preview.
+/// Dollars of notional per unit of quoted price for a typed command:
+/// 100 per contract for options, 1 per share otherwise.
+fn cmd_multiplier(cmd: &ParsedCommand) -> f64 {
+    if cmd.contract.is_some() { 100.0 } else { 1.0 }
+}
+
+/// Returns `(units, limit_price)` for the Typing-state preview — shares for
+/// equities, contracts for options.
 fn compute_order_preview(
     cmd: &ParsedCommand,
     quote: &Quote,
@@ -391,28 +471,37 @@ fn compute_order_preview(
         Modifier::Bid => Some(quote.bid_price),
     };
 
+    let multiplier = cmd_multiplier(cmd);
     let shares = match &cmd.amount {
         None => None,
         Some(Amount::Shares(s)) => Some(*s),
-        Some(Amount::Dollars(d)) => price.map(|p| if p > 0.0 { (*d / p).floor() } else { 0.0 }),
+        Some(Amount::Dollars(d)) => price.map(|p| {
+            if p > 0.0 {
+                (*d / (p * multiplier)).floor()
+            } else {
+                0.0
+            }
+        }),
         Some(Amount::Percent(pct)) => held_qty.map(|qty| (qty * pct / 100.0).floor()),
     };
 
     (shares, price)
 }
 
-/// Compute final shares for the Confirming state (price already locked).
+/// Compute final units (shares or contracts) for the Confirming state
+/// (price already locked).
 pub(crate) fn compute_confirmed_shares(
     cmd: &ParsedCommand,
     price: f64,
     held_qty: Option<f64>,
 ) -> f64 {
+    let multiplier = cmd_multiplier(cmd);
     match &cmd.amount {
         None => 0.0,
         Some(Amount::Shares(s)) => *s,
         Some(Amount::Dollars(d)) => {
             if price > 0.0 {
-                (*d / price).floor()
+                (*d / (price * multiplier)).floor()
             } else {
                 0.0
             }
