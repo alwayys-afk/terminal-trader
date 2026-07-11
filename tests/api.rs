@@ -1,4 +1,3 @@
-use chrono::Datelike;
 /// Integration tests against the real Schwab API.
 ///
 /// Run all:
@@ -1028,6 +1027,161 @@ async fn test_acct_activity_stream() {
 
     timeout(Duration::from_secs(60), listen).await.ok();
     println!("Done.");
+}
+
+/// Subscribe to LEVELONE_OPTIONS for a live, near-the-money AAPL contract and
+/// verify the SUBS succeeds and any data frames parse as `LevelOneOptionTick`.
+///
+///   cargo test test_levelone_options_stream -- --ignored --nocapture
+///
+/// Outside market hours the feed may not push trade-driven updates, so a tick
+/// is not required — but the subscription must be accepted (response code 0),
+/// and any snapshot/update that does arrive must deserialize for the symbol we
+/// asked for.
+#[tokio::test]
+#[ignore]
+async fn test_levelone_options_stream() {
+    use futures::{SinkExt, StreamExt};
+    use terminal_trader::schwab::streamer_types::{
+        LevelOneFeed, LevelOneOptionTick, ServiceName, StreamerInbound, StreamerRequest,
+    };
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    let Some((client, _hash)) = setup().await else {
+        return;
+    };
+
+    // Pick a near-the-money call at least a week out from a live chain.
+    let snapshot = client
+        .get_option_chain("AAPL")
+        .await
+        .expect("get_option_chain failed");
+    let spot = snapshot.underlying_price;
+    assert!(spot > 0.0, "no underlying price");
+
+    let mut chosen: Option<String> = None;
+    for slice in snapshot.expirations.values() {
+        if let Some(c) = slice
+            .calls
+            .iter()
+            .filter(|c| c.days_to_exp >= 7)
+            .min_by(|a, b| (a.strike - spot).abs().total_cmp(&(b.strike - spot).abs()))
+        {
+            chosen = Some(c.osi_symbol.clone());
+            break;
+        }
+    }
+    let symbol = chosen.expect("no call at least a week out");
+    println!("Subscribing LEVELONE_OPTIONS for {symbol} (spot {spot:.2})");
+
+    let info = client
+        .get_streamer_info()
+        .await
+        .expect("get_streamer_info failed");
+    let ws_url = info.streamer_socket_url.expect("missing streamerSocketUrl");
+    let customer_id = info
+        .schwab_client_customer_id
+        .expect("missing schwabClientCustomerId");
+    let correl_id = info
+        .schwab_client_correl_id
+        .expect("missing schwabClientCorrelId");
+    let channel = info.schwab_client_channel.unwrap_or_default();
+    let function_id = info.schwab_client_function_id.unwrap_or_default();
+
+    let (mut ws, _) = connect_async(&ws_url)
+        .await
+        .expect("WebSocket connect failed");
+
+    // LOGIN
+    let login = StreamerRequest::login(
+        &customer_id,
+        &correl_id,
+        &client.access_token().await.expect("access_token"),
+        &channel,
+        &function_id,
+    );
+    ws.send(Message::text(serde_json::to_string(&login).unwrap()))
+        .await
+        .expect("LOGIN send failed");
+    if let Some(Ok(msg)) = ws.next().await {
+        println!("LOGIN response: {}", msg.to_text().unwrap_or_default());
+    }
+
+    // SUBS LEVELONE_OPTIONS
+    let key = symbol.clone();
+    let subs = StreamerRequest::subscribe(
+        LevelOneFeed::Options,
+        &customer_id,
+        &correl_id,
+        std::iter::once(&key),
+    );
+    ws.send(Message::text(serde_json::to_string(&subs).unwrap()))
+        .await
+        .expect("SUBS send failed");
+
+    let mut subs_ok = false;
+    let mut tick_seen = false;
+
+    let listen = async {
+        while let Some(msg) = ws.next().await {
+            match msg {
+                Ok(Message::Text(t)) => match serde_json::from_str::<StreamerInbound>(&t) {
+                    Ok(StreamerInbound::Data { data }) => {
+                        for frame in &data {
+                            if frame.service == ServiceName::LeveloneOptions {
+                                for item in &frame.content {
+                                    let tick: LevelOneOptionTick =
+                                        serde_json::from_value(item.clone())
+                                            .expect("option tick should deserialize");
+                                    assert_eq!(tick.key, symbol, "tick is for subscribed symbol");
+                                    println!(
+                                        "OPTION tick: {} bid={:?} ask={:?} mark={:?} delta={:?}",
+                                        tick.key,
+                                        tick.bid_price,
+                                        tick.ask_price,
+                                        tick.mark,
+                                        tick.delta
+                                    );
+                                    tick_seen = true;
+                                }
+                            }
+                        }
+                    }
+                    Ok(StreamerInbound::Response { response }) => {
+                        for r in &response {
+                            println!(
+                                "RESPONSE: {} {} code={} msg={:?}",
+                                r.service, r.command, r.content.code, r.content.msg
+                            );
+                            if r.service == "LEVELONE_OPTIONS" && r.content.code == 0 {
+                                subs_ok = true;
+                            }
+                        }
+                    }
+                    Ok(StreamerInbound::Notify { .. }) => {}
+                    Err(e) => println!("PARSE ERROR: {e}\n  raw: {t}"),
+                },
+                Ok(Message::Close(frame)) => {
+                    println!("WS closed: {frame:?}");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("WS error: {e}");
+                    break;
+                }
+                _ => {}
+            }
+            // Stop early once we've confirmed the subscription and seen a tick.
+            if subs_ok && tick_seen {
+                break;
+            }
+        }
+    };
+
+    timeout(Duration::from_secs(15), listen).await.ok();
+    assert!(subs_ok, "LEVELONE_OPTIONS subscription was not accepted");
+    println!("Subscription accepted. tick_seen={tick_seen} (ticks need an active market).");
 }
 
 /// Fetch all FIG transactions and position to analyze wash sale behavior.

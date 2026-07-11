@@ -9,7 +9,28 @@ use schwab_trader::types as tr;
 use crate::app::lots::TaxLotStore;
 use crate::app::{AppCommand, AppPrefs, DataMsg, LotCommand, StreamerStatus, lot_store_path_for};
 use crate::schwab::schwab_stream::{SchwabStream, StreamEvent};
-use crate::schwab::{AccountSummary, InstrumentSpec, SchwabAuth, SchwabClient, models::Quote};
+use crate::schwab::{
+    AccountSummary, AssetType, InstrumentSpec, SchwabAuth, SchwabClient, models::Quote,
+};
+
+/// Symbols partitioned by which streamer feed they belong to. Equities go to
+/// LEVELONE_EQUITIES; options (OSI symbols) go to LEVELONE_OPTIONS — the two
+/// feeds are subscribed independently.
+#[derive(Default, Clone)]
+struct FeedSymbols {
+    equities: HashSet<String>,
+    options: HashSet<String>,
+}
+
+impl FeedSymbols {
+    fn insert(&mut self, symbol: String, asset_type: AssetType) {
+        if asset_type == AssetType::Option {
+            self.options.insert(symbol);
+        } else {
+            self.equities.insert(symbol);
+        }
+    }
+}
 
 /// Results from background tasks that need to update DataService state.
 enum BackgroundResult {
@@ -20,9 +41,9 @@ enum BackgroundResult {
     ),
     /// Account activity refresh completed.
     ActivityRefresh {
-        ord_symbols: HashSet<String>,
+        ord: FeedSymbols,
         ord_methods: Vec<(i64, crate::schwab::LotSelectionMethod)>,
-        pos_symbols: Option<HashSet<String>>,
+        pos: Option<FeedSymbols>,
         txns: Vec<schwab_trader::types::Transaction>,
     },
 }
@@ -119,9 +140,8 @@ impl DataService {
         info!("data_service: live");
 
         // Initial REST fetch — positions, orders, quotes first for fast startup.
-        let mut pos_symbols = fetch_positions(&client, &self.account_hash, &self.tx).await;
-        let (mut ord_symbols, ord_methods) =
-            fetch_orders(&client, &self.account_hash, &self.tx).await;
+        let mut pos = fetch_positions(&client, &self.account_hash, &self.tx).await;
+        let (mut ord, ord_methods) = fetch_orders(&client, &self.account_hash, &self.tx).await;
         // Recover lot methods from the orders so later lot rebuilds can attribute
         // sells correctly (transactions don't report the method).
         if self.lot_store.record_order_methods(ord_methods) {
@@ -129,18 +149,23 @@ impl DataService {
             self.save_and_send().await;
         }
 
+        // Temporary command-bar symbols are equity-only for now (the option
+        // chain view in a later phase will add option command symbols).
         let mut cmd_symbols: HashSet<String> = HashSet::new();
-        let mut symbols: HashSet<String> = &pos_symbols | &ord_symbols;
+        // Currently-subscribed symbols per feed. Equities also fold in cmd_symbols.
+        let mut eq_symbols: HashSet<String> = &pos.equities | &ord.equities;
+        let mut opt_symbols: HashSet<String> = &pos.options | &ord.options;
         info!(
-            "data_service: seeded {} symbols ({} pos, {} ord)",
-            symbols.len(),
-            pos_symbols.len(),
-            ord_symbols.len()
+            "data_service: seeded {} equity + {} option symbols",
+            eq_symbols.len(),
+            opt_symbols.len()
         );
 
-        // Seed quotes cache from REST and send initial snapshot
-        let mut quotes_cache: HashMap<String, Quote> = if !symbols.is_empty() {
-            let refs: Vec<&str> = symbols.iter().map(String::as_str).collect();
+        // Seed quotes cache from REST and send initial snapshot. get_quotes
+        // handles both equity and option symbols, so seed the union.
+        let seed: HashSet<String> = &eq_symbols | &opt_symbols;
+        let mut quotes_cache: HashMap<String, Quote> = if !seed.is_empty() {
+            let refs: Vec<&str> = seed.iter().map(String::as_str).collect();
             match client.get_quotes(&refs).await {
                 Ok(q) => {
                     self.tx.send(DataMsg::Quotes(q.clone())).await.ok();
@@ -156,12 +181,17 @@ impl DataService {
         };
 
         // Subscribe to live data
-        if !symbols.is_empty() {
-            info!(
-                "data_service: subscribing LEVELONE_EQUITIES for {:?}",
-                symbols
-            );
-            stream.subscribe_equities(&symbols).await?;
+        if !eq_symbols.is_empty() {
+            info!("data_service: subscribing LEVELONE_EQUITIES for {eq_symbols:?}");
+            stream
+                .subscribe(LevelOneFeed::Equities, &eq_symbols)
+                .await?;
+        }
+        if !opt_symbols.is_empty() {
+            info!("data_service: subscribing LEVELONE_OPTIONS for {opt_symbols:?}");
+            stream
+                .subscribe(LevelOneFeed::Options, &opt_symbols)
+                .await?;
         }
         stream.subscribe_acct_activity().await?;
 
@@ -228,10 +258,10 @@ impl DataService {
                                 self.save_and_send().await;
                             }
                         }
-                        BackgroundResult::ActivityRefresh { ord_symbols: new_ord, ord_methods, pos_symbols: new_pos, txns } => {
-                            ord_symbols = new_ord;
+                        BackgroundResult::ActivityRefresh { ord: new_ord, ord_methods, pos: new_pos, txns } => {
+                            ord = new_ord;
                             if let Some(new_pos) = new_pos {
-                                pos_symbols = new_pos;
+                                pos = new_pos;
                             }
                             // Record recovered lot methods before applying the new
                             // trades so the resulting sells attribute correctly.
@@ -245,14 +275,16 @@ impl DataService {
                                 self.lot_store.rebuild();
                                 self.save_and_send().await;
                             }
-                            let new_symbols = &(&pos_symbols | &ord_symbols) | &cmd_symbols;
-                            if new_symbols != symbols {
-                                info!("data_service: symbol set changed to {:?}", new_symbols);
-                                symbols = new_symbols;
-                                if !symbols.is_empty() {
-                                    stream.subscribe_equities(&symbols).await?;
+                            let new_eq = &(&pos.equities | &ord.equities) | &cmd_symbols;
+                            if new_eq != eq_symbols {
+                                info!("data_service: equity symbol set changed to {new_eq:?}");
+                                eq_symbols = new_eq;
+                                if !eq_symbols.is_empty() {
+                                    stream.subscribe(LevelOneFeed::Equities, &eq_symbols).await?;
                                 }
                             }
+                            let new_opt = &pos.options | &ord.options;
+                            resync_option_subs(&mut stream, &mut opt_symbols, new_opt).await?;
                         }
                     }
                 }
@@ -262,6 +294,12 @@ impl DataService {
                         Some(StreamEvent::EquityTicks(ticks)) => {
                             for tick in &ticks {
                                 apply_equity_tick(tick, &mut quotes_cache);
+                            }
+                            self.tx.send(DataMsg::Quotes(quotes_cache.clone())).await.ok();
+                        }
+                        Some(StreamEvent::OptionTicks(ticks)) => {
+                            for tick in &ticks {
+                                apply_option_tick(tick, &mut quotes_cache);
                             }
                             self.tx.send(DataMsg::Quotes(quotes_cache.clone())).await.ok();
                         }
@@ -280,19 +318,19 @@ impl DataService {
                             let sync_date = self.lot_store.last_sync_date.clone();
                             let bg_tx = bg_tx.clone();
                             tokio::spawn(async move {
-                                let (ord_symbols, ord_methods) = fetch_orders(&client, &acct, &tx).await;
-                                let (pos_symbols, txns) = if needs_positions {
+                                let (ord, ord_methods) = fetch_orders(&client, &acct, &tx).await;
+                                let (pos, txns) = if needs_positions {
                                     // todo: look into this flow. we should probably use the 2 years to account for the lots we can and then do nothing else
                                     // or maybe we should just find out how many of their shares are long term and how many are short term. and then we can do the current price
                                     // split into long term and short term all at the same avg price
                                     info!("data_service: fill detected — refreshing positions and transactions");
                                     let txns = fetch_transactions_since(&client, &acct, &sync_date, tr::TransactionType::Trade).await;
-                                    let pos_symbols = fetch_positions(&client, &acct, &tx).await;
-                                    (Some(pos_symbols), txns)
+                                    let pos = fetch_positions(&client, &acct, &tx).await;
+                                    (Some(pos), txns)
                                 } else {
                                     (None, vec![])
                                 };
-                                let _ = bg_tx.send(BackgroundResult::ActivityRefresh { ord_symbols, ord_methods, pos_symbols, txns }).await;
+                                let _ = bg_tx.send(BackgroundResult::ActivityRefresh { ord, ord_methods, pos, txns }).await;
                             });
                         }
                         None => return Ok(()),
@@ -328,27 +366,27 @@ impl DataService {
                         AppCommand::SubscribeToQuote(sym) => {
                             if cmd_symbols.insert(sym.clone()) {
                                 info!("data_service: subscribing command symbol {sym}");
-                                let new_symbols = &(&pos_symbols | &ord_symbols) | &cmd_symbols;
-                                if new_symbols != symbols {
-                                    symbols = new_symbols;
-                                    if !symbols.is_empty() {
-                                        stream.subscribe_equities(&symbols).await?;
+                                let new_eq = &(&pos.equities | &ord.equities) | &cmd_symbols;
+                                if new_eq != eq_symbols {
+                                    eq_symbols = new_eq;
+                                    if !eq_symbols.is_empty() {
+                                        stream.subscribe(LevelOneFeed::Equities, &eq_symbols).await?;
                                     }
                                 }
                             }
                         }
 
                         AppCommand::ClearCmdSymbols => {
-                            let base = &pos_symbols | &ord_symbols;
+                            let base = &pos.equities | &ord.equities;
                             let to_remove: HashSet<String> = &cmd_symbols - &base;
                             cmd_symbols.clear();
                             if !to_remove.is_empty() {
                                 info!("data_service: unsubscribing command symbols {:?}", to_remove);
                                 for s in &to_remove {
                                     quotes_cache.remove(s);
-                                    symbols.remove(s);
+                                    eq_symbols.remove(s);
                                 }
-                                stream.unsubscribe_equities(&to_remove).await?;
+                                stream.unsubscribe(LevelOneFeed::Equities, &to_remove).await?;
                             }
                         }
                         AppCommand::PlaceOrder { symbol, instruction, quantity, limit_price, tax_lot_method } => {
@@ -602,7 +640,7 @@ impl DataService {
 
 // ── Quote cache ─────────────────────────────────────────────────────────────────
 
-use crate::schwab::streamer_types::LevelOneEquityTick;
+use crate::schwab::streamer_types::{LevelOneEquityTick, LevelOneFeed, LevelOneOptionTick};
 
 fn apply_equity_tick(tick: &LevelOneEquityTick, cache: &mut HashMap<String, Quote>) {
     let q = cache.entry(tick.key.clone()).or_insert_with(|| Quote {
@@ -665,25 +703,116 @@ fn apply_equity_tick(tick: &LevelOneEquityTick, cache: &mut HashMap<String, Quot
     }
 }
 
+/// Merge a LEVELONE_OPTIONS tick into the shared quote cache, keyed by OSI
+/// symbol. Only the price/size fields map onto `Quote`; the greeks the tick
+/// also carries (delta/theta/etc.) are routed separately by the chain view.
+fn apply_option_tick(tick: &LevelOneOptionTick, cache: &mut HashMap<String, Quote>) {
+    let q = cache.entry(tick.key.clone()).or_insert_with(|| Quote {
+        symbol: tick.key.clone(),
+        last_price: 0.0,
+        close_price: 0.0,
+        bid_price: 0.0,
+        ask_price: 0.0,
+        bid_size: 0,
+        ask_size: 0,
+        open_price: 0.0,
+        high_price: 0.0,
+        low_price: 0.0,
+        net_change: 0.0,
+        net_percent_change: 0.0,
+        volume: 0,
+        mark: 0.0,
+        week_52_high: 0.0,
+        week_52_low: 0.0,
+    });
+
+    if let Some(v) = tick.bid_price {
+        q.bid_price = v;
+    }
+    if let Some(v) = tick.ask_price {
+        q.ask_price = v;
+    }
+    if let Some(v) = tick.last_price {
+        q.last_price = v;
+    }
+    if let Some(v) = tick.bid_size {
+        q.bid_size = v;
+    }
+    if let Some(v) = tick.ask_size {
+        q.ask_size = v;
+    }
+    if let Some(v) = tick.volume {
+        q.volume = v;
+    }
+    if let Some(v) = tick.high_price {
+        q.high_price = v;
+    }
+    if let Some(v) = tick.low_price {
+        q.low_price = v;
+    }
+    if let Some(v) = tick.close_price {
+        q.close_price = v;
+    }
+    if let Some(v) = tick.open_price {
+        q.open_price = v;
+    }
+    if let Some(v) = tick.net_change {
+        q.net_change = v;
+    }
+    if let Some(v) = tick.net_percent_change {
+        q.net_percent_change = v;
+    }
+    if let Some(v) = tick.mark {
+        q.mark = v;
+    }
+}
+
 // ── REST helpers ────────────────────────────────────────────────────────────────
 
 async fn fetch_positions(
     client: &SchwabClient,
     account_hash: &str,
     tx: &mpsc::Sender<DataMsg>,
-) -> HashSet<String> {
+) -> FeedSymbols {
     match client.get_positions(account_hash).await {
         Ok((positions, account_info)) => {
-            let symbols = positions.iter().map(|p| p.symbol.clone()).collect();
+            let mut symbols = FeedSymbols::default();
+            for p in &positions {
+                symbols.insert(p.symbol.clone(), p.asset_type);
+            }
             tx.send(DataMsg::Positions(positions)).await.ok();
             tx.send(DataMsg::AccountInfo(account_info)).await.ok();
             symbols
         }
         Err(e) => {
             tx.send(DataMsg::Error(e.to_string())).await.ok();
-            HashSet::new()
+            FeedSymbols::default()
         }
     }
+}
+
+/// Diff the option subscription against `target` and update the stream. SUBS
+/// replaces the full set for a service, so any additions re-SUBS the whole new
+/// set (which also drops removed symbols); a pure removal uses UNSUBS.
+async fn resync_option_subs(
+    stream: &mut SchwabStream,
+    current: &mut HashSet<String>,
+    target: HashSet<String>,
+) -> Result<()> {
+    if target == *current {
+        return Ok(());
+    }
+    let added = &target - &*current;
+    let removed = &*current - &target;
+    if !added.is_empty() {
+        info!("data_service: subscribing LEVELONE_OPTIONS for {target:?}");
+        stream.subscribe(LevelOneFeed::Options, &target).await?;
+    } else if !removed.is_empty() {
+        info!("data_service: unsubscribing LEVELONE_OPTIONS for {removed:?}");
+        stream.unsubscribe(LevelOneFeed::Options, &removed).await?;
+    }
+    *current = target;
+    Ok(())
 }
 
 /// Fetch transactions since the last sync datetime.
@@ -741,18 +870,14 @@ async fn fetch_orders(
     client: &SchwabClient,
     account_hash: &str,
     tx: &mpsc::Sender<DataMsg>,
-) -> (
-    HashSet<String>,
-    Vec<(i64, crate::schwab::LotSelectionMethod)>,
-) {
+) -> (FeedSymbols, Vec<(i64, crate::schwab::LotSelectionMethod)>) {
     match client.get_orders(account_hash).await {
         Ok(orders) => {
             // Only subscribe to symbols from the N most recent orders.
-            let syms = orders
-                .iter()
-                .take(ORDER_SUBSCRIBE_LIMIT)
-                .map(|o| o.symbol.clone())
-                .collect();
+            let mut syms = FeedSymbols::default();
+            for o in orders.iter().take(ORDER_SUBSCRIBE_LIMIT) {
+                syms.insert(o.symbol.clone(), o.asset_type);
+            }
             // Recover tax lot methods (the orders endpoint echoes them; the
             // transactions API does not — see SCHWAB_API_ISSUES.md #5).
             let methods = TaxLotStore::order_method_pairs(&orders);
@@ -761,7 +886,7 @@ async fn fetch_orders(
         }
         Err(e) => {
             tx.send(DataMsg::Error(e.to_string())).await.ok();
-            (HashSet::new(), Vec::new())
+            (FeedSymbols::default(), Vec::new())
         }
     }
 }

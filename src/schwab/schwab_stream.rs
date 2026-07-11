@@ -10,13 +10,15 @@ use tracing::{debug, info, trace, warn};
 
 use crate::schwab::SchwabClient;
 use crate::schwab::streamer_types::{
-    AcctActivityTick, DataFrame, LevelOneEquityTick, ServiceName, StreamerInbound, StreamerRequest,
+    AcctActivityTick, DataFrame, LevelOneEquityTick, LevelOneFeed, LevelOneOptionTick, ServiceName,
+    StreamerInbound, StreamerRequest,
 };
 
 type WsConn = tokio_tungstenite::WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub enum StreamEvent {
     EquityTicks(Vec<LevelOneEquityTick>),
+    OptionTicks(Vec<LevelOneOptionTick>),
     AccountActivity(Vec<AcctActivityTick>),
 }
 
@@ -112,20 +114,24 @@ impl SchwabStream {
         })
     }
 
-    pub async fn subscribe_equities(&mut self, symbols: &HashSet<String>) -> Result<()> {
+    pub async fn subscribe(&mut self, feed: LevelOneFeed, symbols: &HashSet<String>) -> Result<()> {
         let req =
-            StreamerRequest::subs_equities(&self.customer_id, &self.correl_id, symbols.iter());
+            StreamerRequest::subscribe(feed, &self.customer_id, &self.correl_id, symbols.iter());
         self.send_request(&req)
             .await
-            .map_err(|e| anyhow!("LEVELONE_EQUITIES SUBS: {e}"))
+            .map_err(|e| anyhow!("{} SUBS: {e}", feed.label()))
     }
 
-    pub async fn unsubscribe_equities(&mut self, symbols: &HashSet<String>) -> Result<()> {
+    pub async fn unsubscribe(
+        &mut self,
+        feed: LevelOneFeed,
+        symbols: &HashSet<String>,
+    ) -> Result<()> {
         let req =
-            StreamerRequest::unsubs_equities(&self.customer_id, &self.correl_id, symbols.iter());
+            StreamerRequest::unsubscribe(feed, &self.customer_id, &self.correl_id, symbols.iter());
         self.send_request(&req)
             .await
-            .map_err(|e| anyhow!("LEVELONE_EQUITIES UNSUBS: {e}"))
+            .map_err(|e| anyhow!("{} UNSUBS: {e}", feed.label()))
     }
 
     pub async fn subscribe_acct_activity(&mut self) -> Result<()> {
@@ -216,6 +222,25 @@ impl SchwabStream {
                     None
                 } else {
                     Some(StreamEvent::EquityTicks(ticks))
+                }
+            }
+            ServiceName::LeveloneOptions => {
+                trace!("schwab_stream: LEVELONE_OPTIONS tick");
+                let ticks: Vec<LevelOneOptionTick> = frame
+                    .content
+                    .into_iter()
+                    .filter_map(|v| match serde_json::from_value(v) {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            warn!("schwab_stream: failed to parse option tick: {e}");
+                            None
+                        }
+                    })
+                    .collect();
+                if ticks.is_empty() {
+                    None
+                } else {
+                    Some(StreamEvent::OptionTicks(ticks))
                 }
             }
             ServiceName::AcctActivity => {

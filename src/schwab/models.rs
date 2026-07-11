@@ -259,6 +259,9 @@ pub struct Order {
     pub stop_price: Option<f64>,
     pub order_type: OrderType,
     pub instruction: Instruction,
+    /// Equity vs Option (etc.) — drives which streamer feed the symbol is
+    /// subscribed to for live quotes.
+    pub asset_type: AssetType,
     pub status: OrderStatus,
     pub duration: Option<OrderDuration>,
     pub session: Option<OrderSession>,
@@ -442,6 +445,7 @@ impl TryFrom<tr::Order> for Order {
         let leg = o.order_leg_collection.into_iter().next().ok_or(())?;
         let instrument = leg.instrument.ok_or(())?;
         let symbol = instrument_symbol(&instrument).ok_or(())?.to_string();
+        let asset_type = instrument_asset_type(&instrument);
 
         // Compute VWAP from execution legs across all activities.
         let fill_price = {
@@ -469,6 +473,7 @@ impl TryFrom<tr::Order> for Order {
             stop_price: o.stop_price,
             order_type: o.order_type.unwrap_or(OrderType::Unknown),
             instruction: leg.instruction.ok_or(())?,
+            asset_type,
             status: o.status.unwrap_or(OrderStatus::Unknown),
             duration: o.duration,
             session: o.session,
