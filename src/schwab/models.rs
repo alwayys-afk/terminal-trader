@@ -228,6 +228,16 @@ pub struct Position {
     /// How many shares existed at the previous session's close.
     /// Used to detect same-day purchases for day P&L calculation.
     pub previous_session_qty: f64,
+    /// Dollars of notional per point of quoted price: 1 for equities, the
+    /// contract multiplier (usually 100) for options. Prices on this struct
+    /// (`average_cost`, `current_price`) are always per-unit quoted prices;
+    /// `market_value` and the P&L fields are in real dollars.
+    #[serde(default = "default_multiplier")]
+    pub multiplier: f64,
+}
+
+fn default_multiplier() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +310,16 @@ fn instrument_asset_type(inst: &tr::AccountsInstrument) -> AssetType {
     }
 }
 
+/// Dollars of notional per point of quoted price. Options report their
+/// contract multiplier on the instrument (100 except after corporate
+/// actions); everything else trades 1:1.
+fn instrument_multiplier(inst: &tr::AccountsInstrument) -> f64 {
+    match inst {
+        tr::AccountsInstrument::Option(i) => i.option_multiplier.map(f64::from).unwrap_or(100.0),
+        _ => 1.0,
+    }
+}
+
 // ── Conversions ───────────────────────────────────────────────────────────────
 
 impl TryFrom<tr::Position> for Position {
@@ -309,14 +329,17 @@ impl TryFrom<tr::Position> for Position {
         let instrument = p.instrument.ok_or(())?;
         let symbol = instrument_symbol(&instrument).ok_or(())?.to_string();
         let asset_type = instrument_asset_type(&instrument);
+        let multiplier = instrument_multiplier(&instrument);
 
         let long_qty = p.long_quantity.unwrap_or(0.0);
         let short_qty = p.short_quantity.unwrap_or(0.0);
         let quantity = long_qty - short_qty;
         let market_value = p.market_value.unwrap_or(0.0);
         let average_cost = p.average_price.unwrap_or(0.0);
+        // market_value includes the contract multiplier; divide it back out so
+        // current_price is the per-unit quoted price, same scale as quotes.
         let current_price = if quantity != 0.0 {
-            market_value / quantity
+            market_value / quantity / multiplier
         } else {
             average_cost
         };
@@ -340,6 +363,7 @@ impl TryFrom<tr::Position> for Position {
             open_pnl,
             asset_type,
             previous_session_qty,
+            multiplier,
         })
     }
 }
@@ -493,6 +517,66 @@ impl TryFrom<tr::Order> for Order {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the SDK patch for untagged instrument enums (SCHWAB_API_ISSUES.md
+    /// #6): instruments must deserialize into the variant named by their
+    /// `assetType`, not the first structurally-matching one. Without the patch
+    /// everything (including options) parsed as `CashEquivalent`, which broke
+    /// asset-type routing (streamer feeds, option multiplier).
+    #[test]
+    fn accounts_instrument_deserializes_by_asset_type() {
+        let opt: tr::AccountsInstrument = serde_json::from_value(serde_json::json!({
+            "assetType": "OPTION",
+            "symbol": "AAPL  260717C00215000",
+            "putCall": "CALL",
+            "optionMultiplier": 100
+        }))
+        .unwrap();
+        assert!(matches!(opt, tr::AccountsInstrument::Option(_)));
+        assert_eq!(instrument_asset_type(&opt), AssetType::Option);
+        assert_eq!(instrument_multiplier(&opt), 100.0);
+
+        let eq: tr::AccountsInstrument = serde_json::from_value(serde_json::json!({
+            "assetType": "EQUITY",
+            "symbol": "AAPL"
+        }))
+        .unwrap();
+        assert!(matches!(eq, tr::AccountsInstrument::Equity(_)));
+        assert_eq!(instrument_asset_type(&eq), AssetType::Equity);
+        assert_eq!(instrument_multiplier(&eq), 1.0);
+    }
+
+    #[test]
+    fn transaction_instrument_deserializes_by_asset_type() {
+        let opt: tr::TransactionInstrument = serde_json::from_value(serde_json::json!({
+            "assetType": "OPTION",
+            "symbol": "AAPL  260717C00215000",
+            "putCall": "CALL"
+        }))
+        .unwrap();
+        assert!(matches!(
+            opt,
+            tr::TransactionInstrument::TransactionOption(_)
+        ));
+
+        let eq: tr::TransactionInstrument = serde_json::from_value(serde_json::json!({
+            "assetType": "EQUITY",
+            "symbol": "AAPL"
+        }))
+        .unwrap();
+        assert!(matches!(
+            eq,
+            tr::TransactionInstrument::TransactionEquity(_)
+        ));
+
+        // Currency shows up in real trade transactions as the cash side.
+        let cur: tr::TransactionInstrument = serde_json::from_value(serde_json::json!({
+            "assetType": "CURRENCY",
+            "symbol": "CURRENCY_USD"
+        }))
+        .unwrap();
+        assert!(matches!(cur, tr::TransactionInstrument::Currency(_)));
+    }
 
     #[test]
     fn lot_method_api_roundtrip() {

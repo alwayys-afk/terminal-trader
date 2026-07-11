@@ -8,8 +8,8 @@ use self::lots::TaxLotStore;
 use chrono::NaiveDate;
 
 use crate::schwab::{
-    AccountInfo, AccountSummary, AssetType, DataService, Instruction, LotSelectionMethod, Order,
-    Position, Quote, SchwabAuth, SchwabClient, SellLeg, TaxLot, is_long_term,
+    AccountInfo, AccountSummary, DataService, Instruction, LotSelectionMethod, Order, Position,
+    Quote, SchwabAuth, SchwabClient, SellLeg, TaxLot, is_long_term,
 };
 use crate::tui::command::{CommandMode, ListNav};
 
@@ -404,11 +404,7 @@ impl AppState {
     ///   3. Otherwise fall back to (last - close) * quantity.
     pub fn pos_metrics(&self, pos: &Position) -> PosMetrics {
         if let Some(q) = self.stream.quotes.get(&pos.symbol) {
-            let multiplier = if pos.asset_type == AssetType::Option {
-                100.0
-            } else {
-                1.0
-            };
+            let multiplier = pos.multiplier;
             let open_pnl = (q.last_price - pos.average_cost) * pos.quantity * multiplier;
             let day_pnl = self.compute_day_pnl(pos, q.last_price, q.close_price, multiplier);
             PosMetrics {

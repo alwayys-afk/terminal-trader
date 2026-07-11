@@ -406,6 +406,15 @@ impl TaxLotStore {
         let mut modified = false;
 
         for item in &txn.transfer_items {
+            // Option trades are excluded from lot tracking for now: lots model
+            // per-share economics and option quantities/prices carry a contract
+            // multiplier. Options P&L is a future phase (OPTIONS_AUDIT.md F5).
+            if matches!(
+                item.instrument,
+                Some(tr::TransactionInstrument::TransactionOption(_))
+            ) {
+                continue;
+            }
             let symbol = match item
                 .instrument
                 .as_ref()
@@ -829,6 +838,59 @@ mod tests {
             order_id: None,
             trade_datetime: Some(format!("{date}T10:00:00")),
         }
+    }
+
+    /// Option transfer items must not create lots: option economics carry a
+    /// contract multiplier the lot store doesn't model (OPTIONS_AUDIT.md F5).
+    /// An equity item in the same transaction still applies.
+    #[test]
+    fn apply_transaction_skips_option_items() {
+        let txn: tr::Transaction = serde_json::from_value(serde_json::json!({
+            "activityId": 42,
+            "time": "2026-07-01T14:30:00Z",
+            "accountNumber": "hash",
+            "type": "TRADE",
+            "status": "VALID",
+            "subAccount": "CASH",
+            "tradeDate": "2026-07-01T14:30:00Z",
+            "positionId": 1,
+            "orderId": 1,
+            "netAmount": -125.0,
+            "transferItems": [
+                {
+                    "instrument": {
+                        "assetType": "OPTION",
+                        "symbol": "AAPL  260717C00215000",
+                        "putCall": "CALL",
+                        "underlyingSymbol": "AAPL"
+                    },
+                    "amount": 1.0,
+                    "cost": -125.0,
+                    "price": 1.25,
+                    "positionEffect": "OPENING"
+                },
+                {
+                    "instrument": {
+                        "assetType": "EQUITY",
+                        "symbol": "AAPL"
+                    },
+                    "amount": 2.0,
+                    "cost": -400.0,
+                    "price": 200.0,
+                    "positionEffect": "OPENING"
+                }
+            ]
+        }))
+        .expect("transaction JSON should deserialize");
+
+        let mut store = TaxLotStore::default();
+        assert!(store.apply_transaction(&txn), "equity item should apply");
+        assert!(
+            store.lots_for("AAPL  260717C00215000").is_empty(),
+            "option item must not create lots"
+        );
+        assert_eq!(store.lots_for("AAPL").len(), 1);
+        assert!((store.lots_for("AAPL")[0].quantity - 2.0).abs() < QTY_EPSILON);
     }
 
     #[test]

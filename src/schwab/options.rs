@@ -137,6 +137,105 @@ impl OptionChainSnapshot {
     }
 }
 
+// ── OSI symbols ───────────────────────────────────────────────────────────────
+
+/// A parsed OSI option symbol. The wire format is fixed-width 21 chars:
+/// 6-char space-padded root, `YYMMDD`, `C`/`P`, strike ×1000 in 8 digits
+/// (e.g. `AAPL  260717C00215000`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OsiSymbol {
+    pub underlying: String,
+    pub expiration: NaiveDate,
+    pub put_call: PutCall,
+    pub strike: f64,
+}
+
+impl OsiSymbol {
+    /// Parse an OSI-format symbol. Returns `None` for anything that isn't a
+    /// well-formed 21-char OSI string (equity tickers, indexes, etc.), which
+    /// makes this double as the "is this an option symbol?" test.
+    pub fn parse(symbol: &str) -> Option<OsiSymbol> {
+        let b = symbol.as_bytes();
+        if b.len() != 21 {
+            return None;
+        }
+        let root = symbol[..6].trim_end();
+        if root.is_empty() || !root.bytes().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        if !b[6..12].iter().all(u8::is_ascii_digit) || !b[13..21].iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let put_call = match b[12] {
+            b'C' => PutCall::Call,
+            b'P' => PutCall::Put,
+            _ => return None,
+        };
+        let yy: i32 = symbol[6..8].parse().ok()?;
+        let mm: u32 = symbol[8..10].parse().ok()?;
+        let dd: u32 = symbol[10..12].parse().ok()?;
+        let expiration = NaiveDate::from_ymd_opt(2000 + yy, mm, dd)?;
+        let strike = symbol[13..21].parse::<u64>().ok()? as f64 / 1000.0;
+        Some(OsiSymbol {
+            underlying: root.to_string(),
+            expiration,
+            put_call,
+            strike,
+        })
+    }
+
+    /// Render back to the fixed-width OSI wire format.
+    pub fn to_osi_string(&self) -> String {
+        format!(
+            "{:<6}{}{}{:08}",
+            self.underlying,
+            self.expiration.format("%y%m%d"),
+            match self.put_call {
+                PutCall::Call => 'C',
+                PutCall::Put => 'P',
+            },
+            (self.strike * 1000.0).round() as u64,
+        )
+    }
+
+    /// Compact human form, e.g. `AAPL 7/17 215C`. The year is included
+    /// (`7/17/27`) only when the expiration isn't in `today`'s year.
+    pub fn display(&self, today: NaiveDate) -> String {
+        use chrono::Datelike;
+        let date = if self.expiration.year() == today.year() {
+            self.expiration.format("%-m/%-d").to_string()
+        } else {
+            self.expiration.format("%-m/%-d/%y").to_string()
+        };
+        format!(
+            "{} {} {}{}",
+            self.underlying,
+            date,
+            format_strike(self.strike),
+            match self.put_call {
+                PutCall::Call => 'C',
+                PutCall::Put => 'P',
+            },
+        )
+    }
+}
+
+/// Strike without trailing zeros: 215 → "215", 215.5 → "215.5".
+pub fn format_strike(strike: f64) -> String {
+    let s = format!("{strike:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Display form for any symbol: compact contract form for OSI option symbols,
+/// unchanged for everything else. All symbol rendering in the TUI goes
+/// through here.
+pub fn display_symbol(symbol: &str) -> String {
+    match OsiSymbol::parse(symbol) {
+        Some(osi) => osi.display(chrono::Local::now().date_naive()),
+        None => symbol.to_string(),
+    }
+}
+
 /// Parse the date portion of a chain map key. Keys look like `2026-06-19:25`
 /// (expiration date + days-to-expiration); we only need the date.
 fn parse_exp_key(key: &str) -> Option<NaiveDate> {
@@ -282,6 +381,53 @@ mod tests {
             1,
             "the field-less contract is skipped"
         );
+    }
+
+    #[test]
+    fn osi_parse_and_roundtrip() {
+        let osi = OsiSymbol::parse("AAPL  260717C00215000").expect("valid OSI");
+        assert_eq!(osi.underlying, "AAPL");
+        assert_eq!(
+            osi.expiration,
+            NaiveDate::from_ymd_opt(2026, 7, 17).unwrap()
+        );
+        assert_eq!(osi.put_call, PutCall::Call);
+        assert_eq!(osi.strike, 215.0);
+        assert_eq!(osi.to_osi_string(), "AAPL  260717C00215000");
+
+        // Fractional strike and put side.
+        let put = OsiSymbol::parse("F     261218P00012500").expect("valid OSI");
+        assert_eq!(put.underlying, "F");
+        assert_eq!(put.put_call, PutCall::Put);
+        assert_eq!(put.strike, 12.5);
+        assert_eq!(put.to_osi_string(), "F     261218P00012500");
+    }
+
+    #[test]
+    fn osi_parse_rejects_non_options() {
+        for s in [
+            "AAPL",                   // plain ticker
+            "AAPL  260717X00215000",  // bad side char
+            "AAPL  26071C700215000",  // non-digit date
+            "AAPL  260717C0021500",   // 20 chars
+            "AAPL  260717C002150000", // 22 chars
+            "      260717C00215000",  // empty root
+            "$SPX  2607A7C00215000",  // non-alnum root + bad date
+        ] {
+            assert!(OsiSymbol::parse(s).is_none(), "should reject {s:?}");
+        }
+    }
+
+    #[test]
+    fn osi_display_compact() {
+        let osi = OsiSymbol::parse("AAPL  260717C00215000").unwrap();
+        let same_year = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let prev_year = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        assert_eq!(osi.display(same_year), "AAPL 7/17 215C");
+        assert_eq!(osi.display(prev_year), "AAPL 7/17/26 215C");
+
+        let put = OsiSymbol::parse("F     261218P00012500").unwrap();
+        assert_eq!(put.display(same_year), "F 12/18 12.5P");
     }
 
     #[test]
