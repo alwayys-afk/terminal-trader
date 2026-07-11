@@ -7,12 +7,18 @@ use crate::util::{PrefixParseError, prefix_match};
 pub enum Verb {
     Buy,
     Sell,
+    /// Open the option chain page for a symbol (`chain aapl [filters…]`).
+    Chain,
 }
 
 impl FromStr for Verb {
     type Err = PrefixParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        const VERBS: &[(&str, Verb)] = &[("buy", Verb::Buy), ("sell", Verb::Sell)];
+        const VERBS: &[(&str, Verb)] = &[
+            ("buy", Verb::Buy),
+            ("sell", Verb::Sell),
+            ("chain", Verb::Chain),
+        ];
         prefix_match(s, VERBS)
     }
 }
@@ -21,8 +27,37 @@ impl std::fmt::Display for Verb {
         match self {
             Verb::Buy => write!(f, "buy"),
             Verb::Sell => write!(f, "sell"),
+            Verb::Chain => write!(f, "chain"),
         }
     }
+}
+
+/// A filter token on a `chain` command: expiry class, moneyness, or a
+/// specific expiration date.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChainFilter {
+    Weekly,
+    Monthly,
+    Atm,
+    Itm,
+    Otm,
+    Date(ExpirySpec),
+}
+
+fn parse_chain_filter(tok: &str) -> Result<ChainFilter, PrefixParseError> {
+    if let Some(spec) = parse_expiry_date(tok) {
+        return Ok(ChainFilter::Date(spec));
+    }
+    prefix_match(
+        &tok.to_lowercase(),
+        &[
+            ("weekly", ChainFilter::Weekly),
+            ("monthly", ChainFilter::Monthly),
+            ("atm", ChainFilter::Atm),
+            ("itm", ChainFilter::Itm),
+            ("otm", ChainFilter::Otm),
+        ],
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,6 +221,8 @@ pub struct ParsedCommand {
     pub contract: Option<ContractSpec>,
     pub amount: Option<Amount>,
     pub modifier: Modifier,
+    /// Filters on a `chain` command (empty for buy/sell).
+    pub chain_filters: Vec<ChainFilter>,
 }
 
 #[derive(Debug, Clone)]
@@ -511,6 +548,28 @@ pub fn parse_command(input: &str) -> ParseResult {
     }
     let symbol = tokens[1].to_uppercase();
 
+    // `chain <sym> [filters…]` — everything after the symbol is a filter.
+    if verb == Verb::Chain {
+        let mut chain_filters = Vec::new();
+        for tok in &tokens[2..] {
+            match parse_chain_filter(tok) {
+                Ok(fil) => chain_filters.push(fil),
+                Err(PrefixParseError::Unknown(t)) => {
+                    return ParseResult::Invalid(format!("Unknown chain filter: {t}"));
+                }
+                Err(PrefixParseError::Ambiguous(cands)) => return ParseResult::Ambiguous(cands),
+            }
+        }
+        return ParseResult::Valid(ParsedCommand {
+            verb,
+            symbol,
+            contract: None,
+            amount: None,
+            modifier: Modifier::Mid,
+            chain_filters,
+        });
+    }
+
     if tokens.len() == 2 {
         return ParseResult::Valid(ParsedCommand {
             verb,
@@ -518,6 +577,7 @@ pub fn parse_command(input: &str) -> ParseResult {
             contract: None,
             amount: None,
             modifier: Modifier::Mid,
+            chain_filters: Vec::new(),
         });
     }
 
@@ -585,7 +645,8 @@ pub fn parse_command(input: &str) -> ParseResult {
         if "now".starts_with(tok) {
             match verb {
                 Verb::Buy => Modifier::Ask,
-                Verb::Sell => Modifier::Bid,
+                // Chain commands returned above; only sell remains.
+                _ => Modifier::Bid,
             }
         } else {
             match tok.parse::<Modifier>() {
@@ -606,5 +667,6 @@ pub fn parse_command(input: &str) -> ParseResult {
         contract,
         amount,
         modifier,
+        chain_filters: Vec::new(),
     })
 }

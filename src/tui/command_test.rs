@@ -535,3 +535,48 @@ fn token_focus_option_layout() {
     // Equity layout is unchanged.
     assert_eq!(token_focus("buy AAPL 10 ", 12), TokenFocus::Modifier);
 }
+
+// ── chain command ────────────────────────────────────────────────────
+
+use crate::tui::command::ChainFilter;
+
+#[test]
+fn parse_chain_command_plain() {
+    let ParseResult::Valid(cmd) = parse_command("chain aapl") else {
+        panic!("expected Valid");
+    };
+    assert_eq!(cmd.verb, Verb::Chain);
+    assert_eq!(cmd.symbol, "AAPL");
+    assert!(cmd.chain_filters.is_empty());
+}
+
+#[test]
+fn parse_chain_command_filters() {
+    let ParseResult::Valid(cmd) = parse_command("chain aapl weekly atm") else {
+        panic!("expected Valid");
+    };
+    assert_eq!(
+        cmd.chain_filters,
+        vec![ChainFilter::Weekly, ChainFilter::Atm]
+    );
+
+    let ParseResult::Valid(cmd) = parse_command("c spy 7/17") else {
+        panic!("expected Valid");
+    };
+    assert_eq!(cmd.verb, Verb::Chain);
+    assert_eq!(
+        cmd.chain_filters,
+        vec![ChainFilter::Date(ExpirySpec::MonthDay {
+            month: 7,
+            day: 17
+        })]
+    );
+}
+
+#[test]
+fn parse_chain_command_bad_filter() {
+    assert!(matches!(
+        parse_command("chain aapl bogus"),
+        ParseResult::Invalid(_)
+    ));
+}

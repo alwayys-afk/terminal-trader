@@ -205,11 +205,11 @@ pub fn render_command_box(f: &mut Frame, state: &AppState) {
 
             let verb_str = match cmd.verb {
                 Verb::Buy => "BUY",
-                Verb::Sell => "SELL",
+                Verb::Sell | Verb::Chain => "SELL",
             };
             let verb_color = match cmd.verb {
                 Verb::Buy => Color::Green,
-                Verb::Sell => Color::Red,
+                Verb::Sell | Verb::Chain => Color::Red,
             };
 
             // Options confirm against the resolved contract: compact name,
@@ -390,11 +390,11 @@ fn render_typing_preview(
 
     let verb_str = match cmd.verb {
         Verb::Buy => "BUY",
-        Verb::Sell => "SELL",
+        Verb::Sell | Verb::Chain => "SELL",
     };
     let verb_color = match cmd.verb {
         Verb::Buy => Color::Green,
-        Verb::Sell => Color::Red,
+        Verb::Sell | Verb::Chain => Color::Red,
     };
 
     let order_type_str = match &cmd.modifier {

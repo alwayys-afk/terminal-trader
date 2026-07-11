@@ -415,6 +415,17 @@ impl DataService {
                             }
                         }
 
+                        AppCommand::SetOptionCmdSymbols(symbols) => {
+                            if cmd_syms.options != symbols {
+                                for stale in &cmd_syms.options - &symbols {
+                                    quotes_cache.remove(&stale);
+                                }
+                                cmd_syms.options = symbols;
+                                let new_opt = &(&pos.options | &ord.options) | &cmd_syms.options;
+                                resync_option_subs(&mut stream, &mut opt_symbols, new_opt).await?;
+                            }
+                        }
+
                         AppCommand::FetchOptionChain { underlying } => {
                             let client2 = client.clone();
                             let tx2 = self.tx.clone();
