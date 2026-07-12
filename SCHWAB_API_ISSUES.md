@@ -70,5 +70,14 @@ the `assetType` value and fall back to the old first-match order for unknown
 values. Pinned by `accounts_instrument_deserializes_by_asset_type` /
 `transaction_instrument_deserializes_by_asset_type` in `src/schwab/models.rs`.
 
+## 7. Option chain `expirationType` letters don't mean what they look like
+
+`S` ("standard") marks the classic 3rd-Friday monthly expiration, while `M`
+marks the *end-of-month* expiration. Verified live 2026-07-10: the 3rd-Friday
+dates come back `S`. Anything filtering "monthly" expirations must match `S`,
+not `M` (see `ExpiryKind::from_api` in `src/schwab/options.rs`). Chains also
+keep returning already-expired dates (negative `daysToExpiration`) for a day
+or so after expiry — filter them out client-side.
+
 No way to trade EXTO?
 Is there any documentation on how wash sales work
