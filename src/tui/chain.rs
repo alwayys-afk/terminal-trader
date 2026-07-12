@@ -228,7 +228,7 @@ pub fn render(f: &mut Frame, area: Rect, state: &AppState, underlying: &str) {
 fn side_cells(
     state: &AppState,
     contract: Option<&OptionContract>,
-    _call: bool,
+    call: bool,
 ) -> Vec<Cell<'static>> {
     let Some(c) = contract else {
         return vec![Cell::from(""); 5];
@@ -247,13 +247,18 @@ fn side_cells(
         }
     }
     let dim = Style::default().fg(Color::DarkGray);
-    vec![
-        Cell::from(format!("{volume}")).style(dim),
-        Cell::from(format!("{}", c.open_interest)).style(dim),
-        Cell::from(format!("{:+.2}", c.delta)).style(dim),
-        Cell::from(format!("{bid:.2}")),
-        Cell::from(format!("{ask:.2}")),
-    ]
+    let vol_cell = Cell::from(format!("{volume}")).style(dim);
+    let oi_cell = Cell::from(format!("{}", c.open_interest)).style(dim);
+    let delta_cell = Cell::from(format!("{:+.2}", c.delta)).style(dim);
+    let bid_cell = Cell::from(format!("{bid:.2}"));
+    let ask_cell = Cell::from(format!("{ask:.2}"));
+    // Column order mirrors around the strike column, matching the header:
+    // calls read vol oi delta bid ask; puts read bid ask delta oi vol.
+    if call {
+        vec![vol_cell, oi_cell, delta_cell, bid_cell, ask_cell]
+    } else {
+        vec![bid_cell, ask_cell, delta_cell, oi_cell, vol_cell]
+    }
 }
 
 fn render_status(f: &mut Frame, area: Rect, state: &AppState) {

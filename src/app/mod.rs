@@ -395,10 +395,12 @@ impl Default for ChainViewState {
 
 impl ChainViewState {
     /// Expirations passing the current filter, in chronological order.
+    /// Already-expired dates (the API returns them for a while) are dropped.
     pub fn visible_expirations(&self, chain: &OptionChainSnapshot) -> Vec<NaiveDate> {
+        let today = chrono::Local::now().date_naive();
         chain
             .expirations
-            .iter()
+            .range(today..)
             .filter(|(date, slice)| match self.expiry_filter {
                 None => true,
                 Some(ChainExpiryFilter::Weekly) => slice.kind() == ExpiryKind::Weekly,

@@ -2120,5 +2120,10 @@ fn order_summary(order: &crate::schwab::Order) -> String {
         .price
         .map(|p| format!(" @ ${p:.2}"))
         .unwrap_or_default();
-    format!("{side} {:.0} {}{}", order.quantity, order.symbol, price_str)
+    format!(
+        "{side} {:.0} {}{}",
+        order.quantity,
+        crate::schwab::display_symbol(&order.symbol),
+        price_str
+    )
 }

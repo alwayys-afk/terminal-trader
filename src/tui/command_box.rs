@@ -108,6 +108,15 @@ pub fn render_command_box(f: &mut Frame, state: &AppState) {
                 CommandBoxDisplay::QuotePreview => {
                     if let ParseResult::Valid(ref cmd) = ts.parsed {
                         let dim = Style::default().fg(Color::DarkGray);
+                        // Chain commands aren't orders — no order preview.
+                        if cmd.verb == Verb::Chain {
+                            let line = Line::from(Span::styled(
+                                format!("  [Enter] opens the {} option chain", cmd.symbol),
+                                dim,
+                            ));
+                            f.render_widget(Paragraph::new(line), chunks[2]);
+                            return;
+                        }
                         match state.resolve_contract(cmd) {
                             // Option command with a resolved contract.
                             Some(Ok(osi)) => {
