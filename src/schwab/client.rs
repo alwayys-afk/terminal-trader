@@ -18,7 +18,7 @@ const TRADER_BASE: &str = "https://api.schwabapi.com/trader/v1";
 const MARKETDATA_BASE: &str = "https://api.schwabapi.com/marketdata/v1";
 
 /// Minimum remaining lifetime before we proactively refresh the access token.
-const REFRESH_BUFFER_SECS: i64 = 60;
+use super::auth::REFRESH_BUFFER_SECS;
 
 struct SchwabClientInner {
     trader: Arc<schwab_trader::Client>,

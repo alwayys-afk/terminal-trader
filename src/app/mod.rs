@@ -14,6 +14,7 @@ use crate::schwab::{
 };
 use crate::tui::command::{CommandMode, ListNav, ParsedCommand};
 
+pub mod login;
 pub mod lots;
 pub mod operations;
 pub mod seed;
@@ -956,6 +957,7 @@ pub async fn run() -> Result<()> {
     let token_path = crate::data_dir::token_path();
 
     let auth = SchwabAuth::new(api_key, app_secret, token_path);
+    login::ensure_logged_in(&auth).await?;
     let client = SchwabClient::new(auth.clone())
         .await
         .context("authentication failed")?;

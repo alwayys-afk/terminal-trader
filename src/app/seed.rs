@@ -16,6 +16,7 @@ pub async fn pick_seed_lot_store_path() -> Result<String> {
     let token_path = crate::data_dir::token_path();
 
     let auth = SchwabAuth::new(api_key, app_secret, token_path);
+    super::login::ensure_logged_in(&auth).await?;
     let client = SchwabClient::new(auth)
         .await
         .context("authentication failed")?;

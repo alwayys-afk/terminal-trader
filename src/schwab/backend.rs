@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -10,8 +10,11 @@ use crate::app::lots::TaxLotStore;
 use crate::app::{AppCommand, AppPrefs, DataMsg, LotCommand, StreamerStatus, lot_store_path_for};
 use crate::schwab::schwab_stream::{SchwabStream, StreamEvent};
 use crate::schwab::{
-    AccountSummary, AssetType, InstrumentSpec, SchwabAuth, SchwabClient, models::Quote,
+    AccountSummary, AssetType, AuthError, InstrumentSpec, SchwabAuth, SchwabClient, models::Quote,
 };
+
+/// How often to re-check the token file while a Schwab login is needed.
+const LOGIN_REQUIRED_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Symbols partitioned by which streamer feed they belong to. Equities go to
 /// LEVELONE_EQUITIES; options (OSI symbols) go to LEVELONE_OPTIONS — the two
@@ -91,16 +94,27 @@ impl DataService {
                 .send(DataMsg::StreamerStatus(StreamerStatus::Connecting))
                 .await
                 .ok();
+            let mut backoff = std::time::Duration::from_secs(5);
             match self.run_once().await {
                 Ok(()) => {
                     info!("data_service: clean disconnect — reconnecting");
                 }
                 Err(e) => {
-                    error!("data_service: error — {e} — reconnecting in 5s");
-                    self.tx
-                        .send(DataMsg::Error(format!("Stream: {e}")))
-                        .await
-                        .ok();
+                    let msg = match e.downcast_ref::<AuthError>() {
+                        // The saved login is gone or expired. Never prompt
+                        // here (the TUI owns the terminal); say what to do and
+                        // keep checking, since another process may log in.
+                        Some(AuthError::LoginRequired { reason }) => {
+                            backoff = LOGIN_REQUIRED_RETRY;
+                            format!(
+                                "Schwab login needed ({reason}). Quit and restart terminal-trader to log in."
+                            )
+                        }
+                        Some(auth_err) => format!("Auth: {auth_err}"),
+                        None => format!("Stream: {e}"),
+                    };
+                    error!("data_service: error — {e:#} — reconnecting in {backoff:?}");
+                    self.tx.send(DataMsg::Error(msg)).await.ok();
                 }
             }
             if self.switching {
@@ -113,7 +127,7 @@ impl DataService {
                     .send(DataMsg::StreamerStatus(StreamerStatus::Reconnecting))
                     .await
                     .ok();
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(backoff).await;
             }
         }
     }
@@ -127,9 +141,10 @@ impl DataService {
     }
 
     async fn run_once(&mut self) -> Result<()> {
+        // Keep the error's type (AuthError) so run() can spot a needed login.
         let client = SchwabClient::new(self.auth.clone())
             .await
-            .map_err(|e| anyhow!("auth failed: {e}"))?;
+            .map_err(|e| e.context("auth failed"))?;
 
         let mut stream = SchwabStream::connect(&client).await?;
 
