@@ -397,7 +397,15 @@ impl ChainViewState {
     /// Expirations passing the current filter, in chronological order.
     /// Already-expired dates (the API returns them for a while) are dropped.
     pub fn visible_expirations(&self, chain: &OptionChainSnapshot) -> Vec<NaiveDate> {
-        let today = chrono::Local::now().date_naive();
+        self.visible_expirations_as_of(chain, chrono::Local::now().date_naive())
+    }
+
+    /// Expirations on or after `today` that pass the expiry filter.
+    fn visible_expirations_as_of(
+        &self,
+        chain: &OptionChainSnapshot,
+        today: NaiveDate,
+    ) -> Vec<NaiveDate> {
         chain
             .expirations
             .range(today..)
@@ -1063,19 +1071,29 @@ mod tests {
             (7, 13, ExpiryKind::Weekly, &[95.0, 100.0, 105.0]),
             (7, 17, ExpiryKind::Monthly, &[95.0, 100.0, 105.0]),
         ]);
+        // Pin "today" so the fixture's dates never age into the expired range.
+        let today = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
         let mut view = ChainViewState::default();
-        assert_eq!(view.visible_expirations(&chain).len(), 2);
+        assert_eq!(view.visible_expirations_as_of(&chain, today).len(), 2);
 
         view.expiry_filter = Some(ChainExpiryFilter::Weekly);
         assert_eq!(
-            view.visible_expirations(&chain),
+            view.visible_expirations_as_of(&chain, today),
             vec![NaiveDate::from_ymd_opt(2026, 7, 13).unwrap()]
         );
 
         view.expiry_filter = Some(ChainExpiryFilter::Date(
             NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
         ));
-        assert_eq!(view.visible_expirations(&chain).len(), 1);
+        assert_eq!(view.visible_expirations_as_of(&chain, today).len(), 1);
+
+        // Expired expirations drop out once "today" passes them.
+        view.expiry_filter = None;
+        let after_weekly = NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+        assert_eq!(
+            view.visible_expirations_as_of(&chain, after_weekly),
+            vec![NaiveDate::from_ymd_opt(2026, 7, 17).unwrap()]
+        );
     }
 
     #[test]
