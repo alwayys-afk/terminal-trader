@@ -5,7 +5,7 @@
 use terminal_trader::schwab::{SchwabAuth, SchwabClient};
 
 async fn setup() -> Option<(SchwabClient, String)> {
-    dotenvy::dotenv().ok();
+    terminal_trader::data_dir::load_env();
 
     let api_key = match std::env::var("SCHWAB_API_KEY") {
         Ok(v) => v,
@@ -21,8 +21,7 @@ async fn setup() -> Option<(SchwabClient, String)> {
             return None;
         }
     };
-    let token_path =
-        std::env::var("SCHWAB_TOKEN_PATH").unwrap_or_else(|_| "schwab_tokens.json".to_string());
+    let token_path = terminal_trader::data_dir::token_path();
 
     if !std::path::Path::new(&token_path).exists() {
         eprintln!("SKIP: token file not found at {token_path} — run the app first to authenticate");
@@ -56,11 +55,10 @@ async fn setup() -> Option<(SchwabClient, String)> {
 #[tokio::test]
 #[ignore]
 async fn test_dump_all_accounts() {
-    dotenvy::dotenv().ok();
+    terminal_trader::data_dir::load_env();
     let api_key = std::env::var("SCHWAB_API_KEY").expect("SCHWAB_API_KEY");
     let app_secret = std::env::var("SCHWAB_APP_SECRET").expect("SCHWAB_APP_SECRET");
-    let token_path =
-        std::env::var("SCHWAB_TOKEN_PATH").unwrap_or_else(|_| "schwab_tokens.json".to_string());
+    let token_path = terminal_trader::data_dir::token_path();
     let auth = SchwabAuth::new(api_key, app_secret, token_path);
     let client = SchwabClient::new(auth).await.expect("client");
 

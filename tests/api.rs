@@ -9,8 +9,9 @@ use chrono::Datelike;
 ///   cargo test test_acct_activity_stream -- --ignored --nocapture
 ///
 /// Prerequisites:
-///   - A `.env` file (or environment) with SCHWAB_API_KEY and SCHWAB_APP_SECRET
-///   - A valid token file (default: schwab_tokens.json) from a prior auth flow
+///   - SCHWAB_API_KEY and SCHWAB_APP_SECRET in the environment or in the data
+///     dir's `.env` (see src/data_dir.rs)
+///   - A valid token file (default: <data dir>/schwab_tokens.json) from a prior auth flow
 ///
 /// If credentials are missing the tests print a message and pass vacuously.
 use terminal_trader::schwab::{InstrumentSpec, SchwabAuth, SchwabClient};
@@ -20,7 +21,7 @@ use terminal_trader::schwab::{InstrumentSpec, SchwabAuth, SchwabClient};
 /// Returns `(client, account_hash)` if credentials and a token file are
 /// present, or `None` to signal that the test should be skipped.
 async fn setup() -> Option<(SchwabClient, String)> {
-    dotenvy::dotenv().ok();
+    terminal_trader::data_dir::load_env();
 
     let api_key = match std::env::var("SCHWAB_API_KEY") {
         Ok(v) => v,
@@ -36,8 +37,7 @@ async fn setup() -> Option<(SchwabClient, String)> {
             return None;
         }
     };
-    let token_path =
-        std::env::var("SCHWAB_TOKEN_PATH").unwrap_or_else(|_| "schwab_tokens.json".to_string());
+    let token_path = terminal_trader::data_dir::token_path();
 
     if !std::path::Path::new(&token_path).exists() {
         eprintln!("SKIP: token file not found at {token_path} — run the app first to authenticate");
@@ -70,12 +70,11 @@ async fn setup() -> Option<(SchwabClient, String)> {
 #[tokio::test]
 #[ignore]
 async fn test_get_account_hashes() {
-    dotenvy::dotenv().ok();
+    terminal_trader::data_dir::load_env();
 
     let api_key = std::env::var("SCHWAB_API_KEY").expect("SCHWAB_API_KEY not set");
     let app_secret = std::env::var("SCHWAB_APP_SECRET").expect("SCHWAB_APP_SECRET not set");
-    let token_path =
-        std::env::var("SCHWAB_TOKEN_PATH").unwrap_or_else(|_| "schwab_tokens.json".to_string());
+    let token_path = terminal_trader::data_dir::token_path();
 
     if !std::path::Path::new(&token_path).exists() {
         eprintln!("SKIP: token file not found");

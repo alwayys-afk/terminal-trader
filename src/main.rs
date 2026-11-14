@@ -2,7 +2,10 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    // Private runtime files (credentials, tax lots, prefs, log) live outside
+    // the repo; see src/data_dir.rs.
+    terminal_trader::data_dir::ensure_data_dir()?;
+    terminal_trader::data_dir::load_env();
 
     // Handle --seed before setting up TUI logging.
     // Usage: --seed <csv> [--lot-method <fifo|lifo|hifo>]
@@ -27,7 +30,7 @@ async fn main() -> Result<()> {
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("trader.log")?;
+        .open(terminal_trader::data_dir::data_path("trader.log"))?;
     tracing_subscriber::fmt()
         .with_writer(log_file)
         .with_ansi(false)

@@ -51,8 +51,17 @@ terminal-trader/        # workspace root + TUI application crate
 ```sh
 git clone https://github.com/alwayys-afk/terminal-trader.git
 cd terminal-trader
-cp .env.example .env       # then fill in SCHWAB_API_KEY and SCHWAB_APP_SECRET
+git config core.hooksPath .githooks   # pre-push check for account data
+mkdir -p "$HOME/Library/Application Support/terminal-trader"
+cp .env.example "$HOME/Library/Application Support/terminal-trader/.env"   # then fill in SCHWAB_API_KEY and SCHWAB_APP_SECRET
 ```
+
+All private runtime files live in a data directory **outside the repo**:
+`~/Library/Application Support/terminal-trader` (override with `TERMINAL_TRADER_DATA_DIR`). That's
+`.env`, `schwab_tokens.json`, `tax_lots_<account hash>.json`, `app_prefs.json`
+and `trader.log`. The app creates the directory (mode 0700) on first run. Keeping
+them out of the working tree means there's nothing personal in the repo to
+commit by accident.
 
 ### Run
 
@@ -61,7 +70,7 @@ cargo run --release
 ```
 
 On first launch the app opens your browser to complete the Schwab OAuth flow,
-then caches the tokens locally (in `schwab_tokens.json` by default) and refreshes
+then caches the tokens locally (in `schwab_tokens.json` in the data directory) and refreshes
 them automatically on subsequent runs.
 
 ## Contributing

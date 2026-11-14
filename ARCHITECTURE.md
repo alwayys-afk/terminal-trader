@@ -43,11 +43,20 @@ Two `mpsc` channels, no shared state:
 - `DataMsg` (backend -> frontend): positions, quotes, orders, lots, errors, status
 - `AppCommand` (frontend -> backend): subscribe, search, place/cancel/replace orders
 
+## Data Directory
+
+`src/data_dir.rs` is the one place that decides where private runtime files
+live: `$TERMINAL_TRADER_DATA_DIR`, else `~/Library/Application Support/terminal-trader`
+(created 0700 at startup). `.env`, the OAuth token file, per-account tax lots,
+`app_prefs.json` and `trader.log` are all resolved through it; nothing is read
+from or written to the working directory except the bundled `stocks.tsv` /
+`etfs.tsv` symbol lists.
+
 ## Startup Sequence
 
 ```
 1. Authenticate with Schwab API
-2. Load lot store from disk (tax_lots.json)
+2. Load lot store from disk (<data dir>/tax_lots_<account hash>.json)
 3. Spawn DataService with lot store
 4. DataService connects SchwabStream (WebSocket + login)
 5. DataService fetches initial data via REST:

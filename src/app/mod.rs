@@ -643,11 +643,15 @@ impl AppState {
 /// Per-account tax lot file path. Keyed by the encrypted account hash so the
 /// user-visible account number never lands on disk in a file name.
 pub fn lot_store_path_for(account_hash: &str) -> String {
-    format!("tax_lots_{account_hash}.json")
+    crate::data_dir::data_path(&format!("tax_lots_{account_hash}.json"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Path for the small app-level preferences file (last-used account, etc.).
-pub const APP_PREFS_PATH: &str = "app_prefs.json";
+pub fn app_prefs_path() -> std::path::PathBuf {
+    crate::data_dir::data_path("app_prefs.json")
+}
 
 /// Cross-run app preferences. Kept intentionally minimal so it can grow
 /// without churning the auth or lot-store files.
@@ -662,9 +666,10 @@ pub struct AppPrefs {
 
 impl AppPrefs {
     pub fn load() -> Self {
-        match std::fs::read_to_string(APP_PREFS_PATH) {
+        let path = app_prefs_path();
+        match std::fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-                tracing::warn!("failed to parse {APP_PREFS_PATH}: {e} — using defaults");
+                tracing::warn!("failed to parse {}: {e} — using defaults", path.display());
                 Self::default()
             }),
             Err(_) => Self::default(),
@@ -673,7 +678,7 @@ impl AppPrefs {
 
     pub fn save(&self) -> Result<()> {
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(APP_PREFS_PATH, data)?;
+        std::fs::write(app_prefs_path(), data)?;
         Ok(())
     }
 }
@@ -736,8 +741,7 @@ pub fn compute_sell_legs(lots: &[TaxLot], sell_qty: f64) -> Vec<SellLeg> {
 pub async fn run() -> Result<()> {
     let api_key = std::env::var("SCHWAB_API_KEY").context("SCHWAB_API_KEY not set")?;
     let app_secret = std::env::var("SCHWAB_APP_SECRET").context("SCHWAB_APP_SECRET not set")?;
-    let token_path =
-        std::env::var("SCHWAB_TOKEN_PATH").unwrap_or_else(|_| "schwab_tokens.json".to_string());
+    let token_path = crate::data_dir::token_path();
 
     let auth = SchwabAuth::new(api_key, app_secret, token_path);
     let client = SchwabClient::new(auth.clone())

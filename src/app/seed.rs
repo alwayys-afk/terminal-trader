@@ -13,8 +13,7 @@ use crate::schwab::{LotSelectionMethod, QTY_EPSILON, SchwabAuth, SchwabClient};
 pub async fn pick_seed_lot_store_path() -> Result<String> {
     let api_key = std::env::var("SCHWAB_API_KEY").context("SCHWAB_API_KEY not set")?;
     let app_secret = std::env::var("SCHWAB_APP_SECRET").context("SCHWAB_APP_SECRET not set")?;
-    let token_path =
-        std::env::var("SCHWAB_TOKEN_PATH").unwrap_or_else(|_| "schwab_tokens.json".to_string());
+    let token_path = crate::data_dir::token_path();
 
     let auth = SchwabAuth::new(api_key, app_secret, token_path);
     let client = SchwabClient::new(auth)
