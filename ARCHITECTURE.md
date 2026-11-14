@@ -52,10 +52,40 @@ live: `$TERMINAL_TRADER_DATA_DIR`, else `~/Library/Application Support/terminal-
 from or written to the working directory except the bundled `stocks.tsv` /
 `etfs.tsv` symbol lists.
 
+## Authentication
+
+`src/schwab/auth.rs` (`SchwabAuth`) owns the OAuth token file and never
+touches stdin or stdout, so the TUI and a future MCP server can share it.
+
+- `get_valid_token()` returns the saved token, refreshing the access token
+  when it's within 60s of expiring. It never prompts: with no saved login, an
+  expired refresh token (Schwab's last 7 days) or a refresh Schwab rejects, it
+  returns `AuthError::LoginRequired`. Network errors and 5xx/429 responses
+  return `AuthError::Transient` and leave the token file alone.
+- Refreshes run under a cross-process lock on `<token file>.lock`. After
+  taking it, the token is re-read; if another process already refreshed, that
+  token is used instead of calling Schwab again. Saves write a 0600 temp file
+  and rename it into place.
+- `login(on_url)` runs the browser login: it starts an HTTPS listener on
+  `127.0.0.1:8182` (`auth/callback.rs`) with a self-signed certificate kept in
+  the data dir (`auth/cert.rs`, regenerated if missing or broken), hands the
+  authorize URL to `on_url`, waits (5 min default) for the redirect with the
+  matching `state`, exchanges the code and saves the token. Unrelated requests
+  (favicon) are ignored; a mismatched `state` gets an error page and the
+  listener keeps waiting. The token lock is only taken around the save, never
+  across the browser wait.
+- The terminal side lives in `src/app/login.rs`: at startup (and for `--seed`)
+  `ensure_logged_in` prints the URL, opens the browser and explains the
+  certificate warning, before the TUI takes over the terminal. If port 8182 is
+  busy it falls back to pasting the redirect URL.
+- Mid-session, `DataService` treats `LoginRequired` as "tell the user to
+  restart and log in" and re-checks the token file every 60s (another process
+  may have logged in meanwhile); it never prompts.
+
 ## Startup Sequence
 
 ```
-1. Authenticate with Schwab API
+1. Authenticate with Schwab API (browser login first if there's no usable saved login)
 2. Load lot store from disk (<data dir>/tax_lots_<account hash>.json)
 3. Spawn DataService with lot store
 4. DataService connects SchwabStream (WebSocket + login)

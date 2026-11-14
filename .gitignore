@@ -1,6 +1,8 @@
 /target
 .env
-schwab_tokens.json
+schwab_tokens.json*
+callback_cert.pem
+callback_key.pem
 trader.log
 tax_lots*.json
 app_prefs.json

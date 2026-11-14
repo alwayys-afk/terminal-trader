@@ -39,7 +39,7 @@ terminal-trader/        # workspace root + TUI application crate
 
 ### Prerequisites
 
-- Rust 1.85+ (2024 edition)
+- Rust 1.89+ (2024 edition)
 - A [Schwab developer](https://developer.schwab.com) account with an app that
   has the **Trader API** and **Market Data API** products enabled, and a
   callback (redirect) URL set to `https://127.0.0.1:8182`. Creating and
@@ -69,9 +69,27 @@ commit by accident.
 cargo run --release
 ```
 
-On first launch the app opens your browser to complete the Schwab OAuth flow,
-then caches the tokens locally (in `schwab_tokens.json` in the data directory) and refreshes
-them automatically on subsequent runs.
+### Logging in to Schwab
+
+On first launch (and whenever the saved login has expired) the app opens your
+browser at Schwab's login page and waits for Schwab to send you back. It
+receives that redirect itself on `https://127.0.0.1:8182`, so there's nothing
+to copy or paste.
+
+- **The browser will warn that the connection isn't private.** The local
+  listener uses a self-signed certificate that the app generates and keeps in
+  the data directory (`callback_cert.pem` / `callback_key.pem`). Click
+  **Advanced → Proceed to 127.0.0.1**. Because the same certificate is reused,
+  some browsers remember the exception.
+- The app waits up to 5 minutes for the login. If port 8182 is already in use,
+  it falls back to asking you to paste the address the browser ended up on.
+- Tokens are saved in `schwab_tokens.json` in the data directory and refreshed
+  automatically. **Schwab's refresh token lasts 7 days**, so expect to log in
+  in the browser about once a week. If it expires while the app is running, the
+  status line says so; quit and restart to log in again.
+- Several processes can share the token file: refreshes take a lock
+  (`schwab_tokens.json.lock`) and saves are atomic, so two copies of the app
+  never refresh over each other.
 
 ## Contributing
 
