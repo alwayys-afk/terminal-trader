@@ -53,7 +53,9 @@ fn render_title(f: &mut Frame, area: Rect, state: &AppState) {
     let inactive = Style::default().fg(Color::DarkGray);
 
     let (pos_style, ord_style) = match state.current_page {
-        Page::Positions | Page::LotDetail(_) | Page::Operations => (active, inactive),
+        Page::Positions | Page::LotDetail(_) | Page::Operations | Page::OptionChain(_) => {
+            (active, inactive)
+        }
         Page::Orders => (inactive, active),
     };
 
@@ -136,7 +138,7 @@ fn render_table(f: &mut Frame, area: Rect, state: &AppState, computed: &[(&Posit
         cumulative_mkt_val += m.market_value;
 
         rows.push(Row::new(vec![
-            Cell::from(pos.symbol.clone()),
+            Cell::from(crate::schwab::display_symbol(&pos.symbol)),
             Cell::from(format!("{:.2}", pos.quantity)),
             Cell::from(format!("{:.2}", pos.average_cost)),
             Cell::from(format!("{:.2}", m.last_price)),
@@ -171,7 +173,7 @@ fn render_table(f: &mut Frame, area: Rect, state: &AppState, computed: &[(&Posit
     }
 
     let widths = [
-        Constraint::Length(10), // Symbol
+        Constraint::Length(17), // Symbol (compact option form needs up to 17)
         Constraint::Length(8),  // Qty
         Constraint::Length(10), // Avg Cost
         Constraint::Length(10), // Last

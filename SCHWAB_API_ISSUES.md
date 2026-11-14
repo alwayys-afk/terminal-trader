@@ -52,5 +52,32 @@ within Schwab's orders query window (~60 days). For older fills, or to know the
 *specific lots* disposed (still never reported anywhere), we must track lots and
 apply our own matching method locally.
 
+## 6. Instrument `oneOf` schemas are indistinguishable — untagged deserialization always picks the first variant
+
+`AccountsInstrument` and `TransactionInstrument` are `oneOf` unions in the
+spec, which the generator turns into `#[serde(untagged)]` enums. But every
+variant's `assetType` is spec'd as the *full* asset-type enum (`EQUITY`,
+`OPTION`, `CASH_EQUIVALENT`, …) rather than the variant's own constant, and the
+variants otherwise share the same optional fields — so nothing structurally
+distinguishes them, and serde's first-match-wins meant **every** instrument
+(including options) deserialized as the first variant
+(`AccountCashEquivalent`/`TransactionCashEquivalent`). Symbol extraction
+happened to work (all variants carry `symbol`), which hid the bug until
+asset-type routing mattered.
+
+**Fix:** hand-written `Deserialize` impls in `schwab-trader` that dispatch on
+the `assetType` value and fall back to the old first-match order for unknown
+values. Pinned by `accounts_instrument_deserializes_by_asset_type` /
+`transaction_instrument_deserializes_by_asset_type` in `src/schwab/models.rs`.
+
+## 7. Option chain `expirationType` letters don't mean what they look like
+
+`S` ("standard") marks the classic 3rd-Friday monthly expiration, while `M`
+marks the *end-of-month* expiration. Verified live 2026-07-10: the 3rd-Friday
+dates come back `S`. Anything filtering "monthly" expirations must match `S`,
+not `M` (see `ExpiryKind::from_api` in `src/schwab/options.rs`). Chains also
+keep returning already-expired dates (negative `daysToExpiration`) for a day
+or so after expiry — filter them out client-side.
+
 No way to trade EXTO?
 Is there any documentation on how wash sales work

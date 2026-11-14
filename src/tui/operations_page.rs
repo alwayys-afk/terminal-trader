@@ -45,7 +45,7 @@ fn render_title(f: &mut Frame, area: Rect, state: &AppState) {
     let inactive = Style::default().fg(Color::DarkGray);
 
     let (pos_style, ord_style, ops_style) = match state.current_page {
-        Page::Positions | Page::LotDetail(_) => (active, inactive, inactive),
+        Page::Positions | Page::LotDetail(_) | Page::OptionChain(_) => (active, inactive, inactive),
         Page::Orders => (inactive, active, inactive),
         Page::Operations => (inactive, inactive, active),
     };

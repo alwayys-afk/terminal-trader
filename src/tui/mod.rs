@@ -1,4 +1,5 @@
 mod account_pnl;
+mod chain;
 pub mod command;
 mod command_box;
 #[cfg(test)]
@@ -19,7 +20,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 
 use crate::app::{AccountPickerState, AppCommand, AppState, DataMsg, Page};
-use crate::schwab::{Instruction, OrderType};
+use crate::schwab::{AssetType, Instruction, OrderType, OsiSymbol};
 use crate::tui::command::{
     CommandMode, ListNav, Modifier, ParseResult, TokenFocus, TypingState, Verb, token_focus,
 };
@@ -75,14 +76,19 @@ async fn event_loop(
             Page::LotDetail(sym) => Some(sym.clone()),
             _ => None,
         };
+        let chain_sym = match &state.current_page {
+            Page::OptionChain(sym) => Some(sym.clone()),
+            _ => None,
+        };
         let state = &mut *state;
         terminal.draw(|f| {
-            match &lot_sym {
-                Some(sym) => lot_detail::render(f, f.area(), state, sym),
-                None => match state.current_page {
+            match (&lot_sym, &chain_sym) {
+                (Some(sym), _) => lot_detail::render(f, f.area(), state, sym),
+                (_, Some(sym)) => chain::render(f, f.area(), state, sym),
+                _ => match state.current_page {
                     Page::Positions => positions::render(f, f.area(), state),
                     Page::Orders => orders::render(f, f.area(), state),
-                    Page::LotDetail(_) => unreachable!(),
+                    Page::LotDetail(_) | Page::OptionChain(_) => unreachable!(),
                     Page::Operations => operations_page::render(f, f.area(), state),
                 },
             }
@@ -94,6 +100,10 @@ async fn event_loop(
             // Data update from background task.
             Some(msg) = rx.recv() => {
                 state.apply(msg);
+                // A chain arrival can newly resolve a typed contract's expiry
+                // or give the chain page its data (center + subscribe).
+                sync_option_preview(state, cmd_tx);
+                chain_post_update(state, cmd_tx);
             }
 
             // Crossterm keyboard / resize events.
@@ -126,6 +136,18 @@ async fn event_loop(
                                 KeyCode::Esc
                                     if matches!(state.current_page, Page::LotDetail(_)) =>
                                 {
+                                    state.navigate_to(Page::Positions);
+                                    continue;
+                                }
+                                KeyCode::Esc
+                                    if matches!(state.current_page, Page::OptionChain(_)) =>
+                                {
+                                    // Drop the chain's live contract subscription.
+                                    state.chain_view.subscribed.clear();
+                                    cmd_tx.try_send(AppCommand::SetOptionCmdSymbols(
+                                        std::collections::HashSet::new(),
+                                    ))
+                                    .ok();
                                     state.navigate_to(Page::Positions);
                                     continue;
                                 }
@@ -265,6 +287,11 @@ fn handle_key_hidden(
         return;
     }
 
+    // Chain page keys; unhandled ones fall through to the shared bindings.
+    if matches!(state.current_page, Page::OptionChain(_)) && handle_key_chain(state, code, cmd_tx) {
+        return;
+    }
+
     match code {
         // q and Ctrl-C are handled in the event loop (they return Ok(())).
         // Esc from LotDetail is handled in the event loop too.
@@ -295,6 +322,17 @@ fn handle_key_hidden(
             }
             state.positions.filter.clear();
             state.positions.filter_active = true;
+        }
+        // Open the option chain for the selected position's underlying.
+        KeyCode::Char('c') if state.current_page == Page::Positions => {
+            if let Some(symbol) = state.selected_position_symbol() {
+                let underlying = OsiSymbol::parse(&symbol)
+                    .map(|o| o.underlying)
+                    .unwrap_or(symbol);
+                open_chain_page(state, cmd_tx, underlying, &[]);
+            } else {
+                state.status = "No position selected".to_string();
+            }
         }
         // Prefill buy/sell order from selected position.
         KeyCode::Char('b') if state.current_page == Page::Positions => {
@@ -557,13 +595,276 @@ fn update_suggestions(state: &mut AppState, cmd_tx: &mpsc::Sender<AppCommand>, s
     }
 }
 
+/// Open the chain page for an underlying, applying `chain` command filters.
+fn open_chain_page(
+    state: &mut AppState,
+    cmd_tx: &mpsc::Sender<AppCommand>,
+    underlying: String,
+    filters: &[crate::tui::command::ChainFilter],
+) {
+    use crate::app::{ChainExpiryFilter, ChainViewState, MoneynessFilter};
+    use crate::tui::command::ChainFilter;
+
+    let mut view = ChainViewState::default();
+    let today = chrono::Local::now().date_naive();
+    for filter in filters {
+        match filter {
+            ChainFilter::Weekly => view.expiry_filter = Some(ChainExpiryFilter::Weekly),
+            ChainFilter::Monthly => view.expiry_filter = Some(ChainExpiryFilter::Monthly),
+            ChainFilter::Atm => view.moneyness = Some(MoneynessFilter::Atm),
+            ChainFilter::Itm => view.moneyness = Some(MoneynessFilter::Itm),
+            ChainFilter::Otm => view.moneyness = Some(MoneynessFilter::Otm),
+            // Date filters resolve without a chain (explicit / month-day forms).
+            ChainFilter::Date(spec) => match crate::schwab::resolve_expiry(*spec, None, today) {
+                Ok(d) => view.expiry_filter = Some(ChainExpiryFilter::Date(d)),
+                Err(reason) => {
+                    state.status = format!("Chain date filter: {reason}");
+                }
+            },
+        }
+    }
+    state.chain_view = view;
+    if !state.chains.contains_key(&underlying) {
+        if let Err(e) = cmd_tx.try_send(AppCommand::FetchOptionChain {
+            underlying: underlying.clone(),
+        }) {
+            tracing::warn!("failed to send FetchOptionChain: {e}");
+        }
+    }
+    state.navigate_to(Page::OptionChain(underlying));
+    chain_post_update(state, cmd_tx);
+}
+
+/// Reconcile the chain view after navigation, filter changes, or a chain
+/// arrival: clamp indices, honor a pending ATM re-center, and keep the
+/// selected row's contracts subscribed for live ticks.
+fn chain_post_update(state: &mut AppState, cmd_tx: &mpsc::Sender<AppCommand>) {
+    let Page::OptionChain(sym) = &state.current_page else {
+        return;
+    };
+    let Some((chain, _)) = state.chains.get(sym) else {
+        return;
+    };
+    let view = &state.chain_view;
+
+    let dates = view.visible_expirations(chain);
+    let (exp_idx, strike_idx, symbols) = if dates.is_empty() {
+        (0, 0, std::collections::HashSet::new())
+    } else {
+        let exp_idx = view.expiration_idx.min(dates.len() - 1);
+        let slice = &chain.expirations[&dates[exp_idx]];
+        let rows = view.rows(slice, chain.underlying_price);
+        if rows.is_empty() {
+            (exp_idx, 0, std::collections::HashSet::new())
+        } else {
+            let strike_idx = if view.center_pending {
+                // Center on the strike closest to spot.
+                rows.iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (a.strike - chain.underlying_price)
+                            .abs()
+                            .total_cmp(&(b.strike - chain.underlying_price).abs())
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            } else {
+                view.strike_idx.min(rows.len() - 1)
+            };
+            let mut symbols = std::collections::HashSet::new();
+            if let Some(c) = rows[strike_idx].call {
+                symbols.insert(c.osi_symbol.clone());
+            }
+            if let Some(p) = rows[strike_idx].put {
+                symbols.insert(p.osi_symbol.clone());
+            }
+            (exp_idx, strike_idx, symbols)
+        }
+    };
+
+    let view = &mut state.chain_view;
+    view.expiration_idx = exp_idx;
+    view.strike_idx = strike_idx;
+    view.center_pending = false;
+    if symbols != view.subscribed {
+        view.subscribed = symbols.clone();
+        if let Err(e) = cmd_tx.try_send(AppCommand::SetOptionCmdSymbols(symbols)) {
+            tracing::warn!("failed to send SetOptionCmdSymbols: {e}");
+        }
+    }
+}
+
+/// Chain page keys. Returns false for keys the shared bindings should handle
+/// (page switches, nav history, quit).
+fn handle_key_chain(
+    state: &mut AppState,
+    code: KeyCode,
+    cmd_tx: &mpsc::Sender<AppCommand>,
+) -> bool {
+    use crate::app::{ChainExpiryFilter, MoneynessFilter};
+
+    let Page::OptionChain(underlying) = state.current_page.clone() else {
+        return false;
+    };
+    // Toggle helper: pressing the active filter's key clears it.
+    fn toggle<T: PartialEq + Copy>(slot: &mut Option<T>, value: T) {
+        *slot = if *slot == Some(value) {
+            None
+        } else {
+            Some(value)
+        };
+    }
+
+    let view = &mut state.chain_view;
+    match code {
+        KeyCode::Left | KeyCode::Char('h') => {
+            view.expiration_idx = view.expiration_idx.saturating_sub(1);
+            view.center_pending = true;
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            view.expiration_idx = view.expiration_idx.saturating_add(1);
+            view.center_pending = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.strike_idx = view.strike_idx.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            view.strike_idx = view.strike_idx.saturating_add(1);
+        }
+        KeyCode::Char('g') => view.strike_idx = 0,
+        KeyCode::Char('G') => view.strike_idx = usize::MAX,
+        KeyCode::Tab => {
+            view.side = match view.side {
+                crate::schwab::PutCall::Call => crate::schwab::PutCall::Put,
+                crate::schwab::PutCall::Put => crate::schwab::PutCall::Call,
+            };
+            // ITM/OTM row filters are side-relative; re-center on the flip.
+            if view.moneyness.is_some() {
+                view.center_pending = true;
+            }
+        }
+        KeyCode::Char('w') => {
+            toggle(&mut view.expiry_filter, ChainExpiryFilter::Weekly);
+            view.center_pending = true;
+        }
+        KeyCode::Char('m') => {
+            toggle(&mut view.expiry_filter, ChainExpiryFilter::Monthly);
+            view.center_pending = true;
+        }
+        KeyCode::Char('a') => {
+            toggle(&mut view.moneyness, MoneynessFilter::Atm);
+            view.center_pending = true;
+        }
+        KeyCode::Char('i') => {
+            toggle(&mut view.moneyness, MoneynessFilter::Itm);
+            view.center_pending = true;
+        }
+        KeyCode::Char('o') => {
+            toggle(&mut view.moneyness, MoneynessFilter::Otm);
+            view.center_pending = true;
+        }
+        KeyCode::Char('x') => {
+            view.expiry_filter = None;
+            view.moneyness = None;
+            view.center_pending = true;
+        }
+        KeyCode::Char('r') => {
+            if let Err(e) = cmd_tx.try_send(AppCommand::FetchOptionChain {
+                underlying: underlying.clone(),
+            }) {
+                tracing::warn!("failed to send FetchOptionChain: {e}");
+            }
+            state.status = format!("Refreshing {underlying} chain...");
+            return true;
+        }
+        // Buy/sell the selected contract (Enter = buy the focused side).
+        KeyCode::Char('b') | KeyCode::Char('s') | KeyCode::Enter => {
+            let verb = if code == KeyCode::Char('s') {
+                Verb::Sell
+            } else {
+                Verb::Buy
+            };
+            if let Some(osi) = selected_chain_contract(state) {
+                open_position_order(state, cmd_tx, osi, verb, None);
+            } else {
+                state.status = "No contract selected".to_string();
+            }
+            return true;
+        }
+        _ => return false,
+    }
+    chain_post_update(state, cmd_tx);
+    true
+}
+
+/// OSI symbol of the chain page's selected contract on the focused side.
+fn selected_chain_contract(state: &AppState) -> Option<String> {
+    let Page::OptionChain(sym) = &state.current_page else {
+        return None;
+    };
+    let (chain, _) = state.chains.get(sym)?;
+    let view = &state.chain_view;
+    let date = view.selected_expiration(chain)?;
+    let rows = view.rows(&chain.expirations[&date], chain.underlying_price);
+    let row = rows.get(view.strike_idx.min(rows.len().checked_sub(1)?))?;
+    let contract = match view.side {
+        crate::schwab::PutCall::Call => row.call,
+        crate::schwab::PutCall::Put => row.put,
+    }?;
+    Some(contract.osi_symbol.clone())
+}
+
+/// Keep option-preview data flowing while an option command is typed: fetch
+/// the underlying's chain once, and subscribe the resolved contract's OSI
+/// symbol for live ticks as soon as the expiration resolves. Cheap no-op for
+/// equity commands. Called after input changes and after data messages (a
+/// chain arriving can newly resolve a relative expiry).
+fn sync_option_preview(state: &mut AppState, cmd_tx: &mpsc::Sender<AppCommand>) {
+    let CommandMode::Typing(ts) = &state.command_mode else {
+        return;
+    };
+    let ParseResult::Valid(cmd) = &ts.parsed else {
+        return;
+    };
+    if cmd.contract.is_none() {
+        return;
+    }
+    let symbol = cmd.symbol.clone();
+    let needs_chain =
+        !state.chains.contains_key(&symbol) && ts.last_chain_sym.as_deref() != Some(&symbol);
+    let osi = match state.resolve_contract(cmd) {
+        Some(Ok(osi)) => Some(osi.to_osi_string()),
+        _ => None,
+    };
+    let subscribe = osi.filter(|o| ts.last_option_osi.as_deref() != Some(o));
+
+    if let CommandMode::Typing(ref mut ts) = state.command_mode {
+        if needs_chain {
+            ts.last_chain_sym = Some(symbol.clone());
+            if let Err(e) = cmd_tx.try_send(AppCommand::FetchOptionChain { underlying: symbol }) {
+                tracing::warn!("failed to send FetchOptionChain: {e}");
+            }
+        }
+        if let Some(osi) = subscribe {
+            ts.last_option_osi = Some(osi.clone());
+            if let Err(e) = cmd_tx.try_send(AppCommand::SubscribeToQuote(osi)) {
+                tracing::warn!("failed to send SubscribeToQuote: {e}");
+            }
+        }
+    }
+}
+
 /// Keep autocomplete in sync with the current token focus.
 /// Called after every input change (char insert, backspace).
 fn sync_autocomplete_to_focus(state: &mut AppState) {
     if let CommandMode::Typing(ref mut ts) = state.command_mode {
         let focus = token_focus(&ts.input, ts.cursor);
         match focus {
-            TokenFocus::Amount | TokenFocus::Verb | TokenFocus::Modifier => {
+            TokenFocus::Amount
+            | TokenFocus::Verb
+            | TokenFocus::Contract
+            | TokenFocus::Expiry
+            | TokenFocus::Modifier => {
                 ts.autocomplete.clear();
             }
             TokenFocus::Symbol => {} // handled by update_suggestions
@@ -687,6 +988,17 @@ fn handle_key_typing(
             sync_autocomplete_to_focus(state);
         }
         KeyCode::Enter => {
+            // A valid chain command opens the chain page directly.
+            if let CommandMode::Typing(ref ts) = state.command_mode
+                && let ParseResult::Valid(cmd) = &ts.parsed
+                && cmd.verb == Verb::Chain
+            {
+                let (symbol, filters) = (cmd.symbol.clone(), cmd.chain_filters.clone());
+                cmd_tx.try_send(AppCommand::ClearCmdSymbols).ok();
+                state.command_mode = CommandMode::Hidden;
+                open_chain_page(state, cmd_tx, symbol, &filters);
+                return;
+            }
             // Extract the parsed command and replace_order_id without holding a borrow.
             let ready = if let CommandMode::Typing(ref ts) = state.command_mode
                 && let ParseResult::Valid(cmd) = &ts.parsed
@@ -709,29 +1021,40 @@ fn handle_key_typing(
                 }
             }
             if let Some((cmd, input, replace_order_id)) = ready {
+                // Option commands price and size against the resolved contract;
+                // equities against the symbol's own quote.
+                let osi = match state.resolve_contract(&cmd) {
+                    None => None,
+                    Some(Ok(osi)) => Some(osi),
+                    Some(Err(reason)) => {
+                        state.status = format!("Contract not resolved yet: {reason}");
+                        return;
+                    }
+                };
+                let quote = match &osi {
+                    Some(osi) => state.quote_for_contract(osi),
+                    None => state.stream.quotes.get(&cmd.symbol).cloned(),
+                };
                 let price = match &cmd.modifier {
                     Modifier::Market => Some(0.0),
                     Modifier::Limit(p) => Some(*p),
-                    Modifier::Mid => state
-                        .stream
-                        .quotes
-                        .get(&cmd.symbol)
-                        .map(|q| (q.bid_price + q.ask_price) / 2.0),
-                    Modifier::Ask => state.stream.quotes.get(&cmd.symbol).map(|q| q.ask_price),
-                    Modifier::Bid => state.stream.quotes.get(&cmd.symbol).map(|q| q.bid_price),
+                    Modifier::Mid => quote.as_ref().map(|q| (q.bid_price + q.ask_price) / 2.0),
+                    Modifier::Ask => quote.as_ref().map(|q| q.ask_price),
+                    Modifier::Bid => quote.as_ref().map(|q| q.bid_price),
                 };
                 if let Some(p) = price {
                     let rp = round_price(p);
-                    let held_qty = state.positions.held_qty(&cmd.symbol);
+                    let held_sym = osi
+                        .as_ref()
+                        .map(|o| o.to_osi_string())
+                        .unwrap_or_else(|| cmd.symbol.clone());
+                    let held_qty = state.positions.held_qty(&held_sym);
                     let shares = command_box::compute_confirmed_shares(&cmd, rp, held_qty);
                     if shares < 1.0 {
                         state.status = if held_qty.is_none()
                             && matches!(cmd.amount, Some(crate::tui::command::Amount::Percent(_)))
                         {
-                            format!(
-                                "Error: no position found for {} to compute percent",
-                                cmd.symbol
-                            )
+                            format!("Error: no position found for {held_sym} to compute percent")
                         } else {
                             "Error: order resolves to 0 shares".to_string()
                         };
@@ -740,6 +1063,7 @@ fn handle_key_typing(
                     state.command_mode = CommandMode::Confirming {
                         cmd,
                         price: rp,
+                        osi,
                         input,
                         replace_order_id,
                     };
@@ -763,32 +1087,36 @@ fn handle_key_typing(
             handle_key_typing(state, KeyCode::Backspace, KeyModifiers::SUPER, cmd_tx);
         }
         KeyCode::Char(c) => {
-            let (subscribe_sym, search_sym) = if let CommandMode::Typing(ref mut ts) =
-                state.command_mode
-            {
-                ts.insert_char(c);
-                let sym = ts.parsed_symbol();
-                // On space past the symbol, commit and subscribe to its quote stream.
-                let focus = token_focus(&ts.input, ts.cursor);
-                let subscribe_sym = if matches!(focus, TokenFocus::Amount | TokenFocus::Modifier)
-                    && sym != ts.last_fetched_sym
-                {
-                    ts.last_fetched_sym = sym.clone();
-                    sym.clone()
+            let (subscribe_sym, search_sym) =
+                if let CommandMode::Typing(ref mut ts) = state.command_mode {
+                    ts.insert_char(c);
+                    let sym = ts.parsed_symbol();
+                    // On space past the symbol, commit and subscribe to its quote stream.
+                    let focus = token_focus(&ts.input, ts.cursor);
+                    let subscribe_sym = if matches!(
+                        focus,
+                        TokenFocus::Contract
+                            | TokenFocus::Expiry
+                            | TokenFocus::Amount
+                            | TokenFocus::Modifier
+                    ) && sym != ts.last_fetched_sym
+                    {
+                        ts.last_fetched_sym = sym.clone();
+                        sym.clone()
+                    } else {
+                        None
+                    };
+                    let search_sym = if sym != ts.last_searched_sym {
+                        ts.last_searched_sym = sym.clone();
+                        ts.autocomplete.clear();
+                        sym
+                    } else {
+                        None
+                    };
+                    (subscribe_sym, search_sym)
                 } else {
-                    None
+                    (None, None)
                 };
-                let search_sym = if sym != ts.last_searched_sym {
-                    ts.last_searched_sym = sym.clone();
-                    ts.autocomplete.clear();
-                    sym
-                } else {
-                    None
-                };
-                (subscribe_sym, search_sym)
-            } else {
-                (None, None)
-            };
 
             if let Some(sym) = subscribe_sym {
                 if let Err(e) = cmd_tx.try_send(AppCommand::SubscribeToQuote(sym.clone())) {
@@ -810,6 +1138,7 @@ fn handle_key_typing(
         }
         _ => {}
     }
+    sync_option_preview(state, cmd_tx);
 }
 
 /// Return to the Typing state with the original input preserved.
@@ -845,15 +1174,39 @@ fn handle_key_confirming(state: &mut AppState, code: KeyCode, cmd_tx: &mpsc::Sen
                 CommandMode::Confirming {
                     cmd,
                     price,
+                    osi,
                     replace_order_id,
                     ..
                 } => {
                     let price = *price;
-                    let instruction = match cmd.verb {
-                        Verb::Buy => Instruction::Buy,
-                        Verb::Sell => Instruction::Sell,
+                    // Options trade the resolved OSI symbol with to-open/to-close
+                    // instructions derived from the held position; equities keep
+                    // plain Buy/Sell on the ticker.
+                    let (order_symbol, asset_type) = match osi {
+                        Some(osi) => (osi.to_osi_string(), AssetType::Option),
+                        None => (cmd.symbol.clone(), AssetType::Equity),
                     };
-                    let held_qty = state.positions.held_qty(&cmd.symbol);
+                    let held_qty = state.positions.held_qty(&order_symbol);
+                    let instruction = match (asset_type, cmd.verb.clone()) {
+                        (AssetType::Option, Verb::Buy) => {
+                            if held_qty.unwrap_or(0.0) < 0.0 {
+                                Instruction::BuyToClose
+                            } else {
+                                Instruction::BuyToOpen
+                            }
+                        }
+                        (AssetType::Option, Verb::Sell) => {
+                            if held_qty.unwrap_or(0.0) > 0.0 {
+                                Instruction::SellToClose
+                            } else {
+                                Instruction::SellToOpen
+                            }
+                        }
+                        (_, Verb::Buy) => Instruction::Buy,
+                        (_, Verb::Sell) => Instruction::Sell,
+                        // Chain commands never reach the confirm screen.
+                        (_, Verb::Chain) => unreachable!("chain commands never confirm"),
+                    };
                     let quantity = command_box::compute_confirmed_shares(cmd, price, held_qty);
                     let limit_price = match &cmd.modifier {
                         Modifier::Market => None,
@@ -880,19 +1233,21 @@ fn handle_key_confirming(state: &mut AppState, code: KeyCode, cmd_tx: &mpsc::Sen
                                 .and_then(|o| o.tax_lot_method);
                             vec![AppCommand::ReplaceOrder {
                                 order_id: *id,
-                                symbol: cmd.symbol.clone(),
+                                symbol: order_symbol,
+                                asset_type,
                                 instruction,
                                 quantity,
                                 limit_price,
                                 tax_lot_method: method,
                             }]
                         }
-                        // A new sell auto-selects the method per leg and splits
-                        // into one order per leg when it spans long-term and
-                        // short-term lots. Buys carry no method.
+                        // A new equity sell auto-selects the tax-lot method per
+                        // leg and splits into one order per leg when it spans
+                        // long-term and short-term lots. Buys and options (no
+                        // lot tracking) carry no method and never split.
                         None => {
                             let legs: Vec<(f64, Option<crate::schwab::LotSelectionMethod>)> =
-                                if cmd.verb == Verb::Sell {
+                                if asset_type == AssetType::Equity && cmd.verb == Verb::Sell {
                                     crate::app::compute_sell_legs(
                                         state.lot_store.lots_for(&cmd.symbol),
                                         quantity,
@@ -905,7 +1260,8 @@ fn handle_key_confirming(state: &mut AppState, code: KeyCode, cmd_tx: &mpsc::Sen
                                 };
                             legs.into_iter()
                                 .map(|(qty, method)| AppCommand::PlaceOrder {
-                                    symbol: cmd.symbol.clone(),
+                                    symbol: order_symbol.clone(),
+                                    asset_type,
                                     instruction,
                                     quantity: qty,
                                     limit_price,
@@ -955,6 +1311,28 @@ fn handle_key_confirm_cancel(
     }
 }
 
+/// Command-bar form of a symbol: equities pass through; OSI option symbols
+/// expand to grammar tokens (`AAPL 215c 7/17/26`) so prefilled inputs
+/// round-trip through the parser (OSI strings contain spaces and cannot).
+fn command_symbol_tokens(symbol: &str) -> String {
+    match OsiSymbol::parse(symbol) {
+        Some(osi) => {
+            let side = match osi.put_call {
+                crate::schwab::PutCall::Call => 'c',
+                crate::schwab::PutCall::Put => 'p',
+            };
+            format!(
+                "{} {}{} {}",
+                osi.underlying,
+                crate::schwab::format_strike(osi.strike),
+                side,
+                osi.expiration.format("%-m/%-d/%y"),
+            )
+        }
+        None => symbol.to_string(),
+    }
+}
+
 /// Build and open the order-entry dialog pre-filled from an existing order.
 /// `as_replace` — confirming replaces the original order (edit); false = new order.
 /// `flip_side`  — invert buy↔sell (opposite order).
@@ -978,8 +1356,9 @@ fn open_order_dialog(
         true => "buy",
         false => "sell",
     };
+    let symbol_tokens = command_symbol_tokens(&order.symbol);
     let input = if drop_price {
-        format!("{verb} {} {:.0}", order.symbol, order.quantity)
+        format!("{verb} {symbol_tokens} {:.0}", order.quantity)
     } else {
         let modifier = match order.order_type {
             OrderType::Market | OrderType::MarketOnClose => "market".to_string(),
@@ -988,7 +1367,7 @@ fn open_order_dialog(
                 .map(|p| format!("{p:.2}"))
                 .unwrap_or_else(|| "market".to_string()),
         };
-        format!("{verb} {} {:.0} {modifier}", order.symbol, order.quantity)
+        format!("{verb} {symbol_tokens} {:.0} {modifier}", order.quantity)
     };
     let symbol = order.symbol.clone();
     let replace_order_id = if as_replace {
@@ -1013,9 +1392,10 @@ fn open_position_order(
     verb: Verb,
     qty: Option<f64>,
 ) {
+    let symbol_tokens = command_symbol_tokens(&symbol);
     let input = match qty {
-        Some(q) => format!("{verb} {symbol} {q:.0}"),
-        None => format!("{verb} {symbol} "),
+        Some(q) => format!("{verb} {symbol_tokens} {q:.0}"),
+        None => format!("{verb} {symbol_tokens} "),
     };
     if let Err(e) = cmd_tx.try_send(AppCommand::SubscribeToQuote(symbol.clone())) {
         tracing::warn!("failed to send SubscribeToQuote: {e}");
@@ -1740,5 +2120,10 @@ fn order_summary(order: &crate::schwab::Order) -> String {
         .price
         .map(|p| format!(" @ ${p:.2}"))
         .unwrap_or_default();
-    format!("{side} {:.0} {}{}", order.quantity, order.symbol, price_str)
+    format!(
+        "{side} {:.0} {}{}",
+        order.quantity,
+        crate::schwab::display_symbol(&order.symbol),
+        price_str
+    )
 }

@@ -1398,7 +1398,7 @@ pub mod types {
     ///}
     /// ```
     /// </details>
-    #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
+    #[derive(:: serde :: Serialize, Clone, Debug)]
     #[serde(untagged)]
     pub enum AccountsInstrument {
         CashEquivalent(AccountCashEquivalent),
@@ -1406,6 +1406,55 @@ pub mod types {
         FixedIncome(AccountFixedIncome),
         MutualFund(AccountMutualFund),
         Option(AccountOption),
+    }
+
+    /// PATCHED (see SCHWAB_API_ISSUES.md): the spec models this as a plain
+    /// `oneOf`, so the generated impl was `#[serde(untagged)]` — first
+    /// structurally-matching variant wins. Every variant's `assetType` enum
+    /// accepts *all* asset-type strings and the variants share the same
+    /// optional fields, so everything (including options) deserialized as
+    /// `CashEquivalent`. Dispatch on the `assetType` value instead; unknown
+    /// values fall back to the old first-match-wins order so nothing that
+    /// parsed before fails now.
+    impl<'de> ::serde::Deserialize<'de> for AccountsInstrument {
+        fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+        where
+            D: ::serde::Deserializer<'de>,
+        {
+            let value = ::serde_json::Value::deserialize(deserializer)?;
+            let tag = value
+                .get("assetType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let parsed = match tag {
+                "CASH_EQUIVALENT" => ::serde_json::from_value(value).map(Self::CashEquivalent),
+                "EQUITY" => ::serde_json::from_value(value).map(Self::Equity),
+                "FIXED_INCOME" => ::serde_json::from_value(value).map(Self::FixedIncome),
+                "MUTUAL_FUND" => ::serde_json::from_value(value).map(Self::MutualFund),
+                "OPTION" => ::serde_json::from_value(value).map(Self::Option),
+                _ => {
+                    return ::serde_json::from_value::<AccountCashEquivalent>(value.clone())
+                        .map(Self::CashEquivalent)
+                        .or_else(|_| {
+                            ::serde_json::from_value::<AccountEquity>(value.clone())
+                                .map(Self::Equity)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<AccountFixedIncome>(value.clone())
+                                .map(Self::FixedIncome)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<AccountMutualFund>(value.clone())
+                                .map(Self::MutualFund)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<AccountOption>(value).map(Self::Option)
+                        })
+                        .map_err(::serde::de::Error::custom);
+                }
+            };
+            parsed.map_err(::serde::de::Error::custom)
+        }
     }
 
     impl ::std::convert::From<AccountCashEquivalent> for AccountsInstrument {
@@ -11436,7 +11485,7 @@ pub mod types {
     ///}
     /// ```
     /// </details>
-    #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
+    #[derive(:: serde :: Serialize, Clone, Debug)]
     #[serde(untagged)]
     pub enum TransactionInstrument {
         TransactionCashEquivalent(TransactionCashEquivalent),
@@ -11450,6 +11499,80 @@ pub mod types {
         TransactionMutualFund(TransactionMutualFund),
         TransactionOption(TransactionOption),
         Product(Product),
+    }
+
+    /// PATCHED (see SCHWAB_API_ISSUES.md): same `oneOf`-as-untagged problem as
+    /// `AccountsInstrument` — every instrument matched the first variant
+    /// (`TransactionCashEquivalent`) regardless of its actual `assetType`.
+    /// Dispatch on the `assetType` value; unknown values fall back to the old
+    /// first-match-wins order so nothing that parsed before fails now.
+    impl<'de> ::serde::Deserialize<'de> for TransactionInstrument {
+        fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+        where
+            D: ::serde::Deserializer<'de>,
+        {
+            let value = ::serde_json::Value::deserialize(deserializer)?;
+            let tag = value
+                .get("assetType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let parsed = match tag {
+                "CASH_EQUIVALENT" => {
+                    ::serde_json::from_value(value).map(Self::TransactionCashEquivalent)
+                }
+                "COLLECTIVE_INVESTMENT" => {
+                    ::serde_json::from_value(value).map(Self::CollectiveInvestment)
+                }
+                "CURRENCY" => ::serde_json::from_value(value).map(Self::Currency),
+                "EQUITY" => ::serde_json::from_value(value).map(Self::TransactionEquity),
+                "FIXED_INCOME" => ::serde_json::from_value(value).map(Self::TransactionFixedIncome),
+                "FOREX" => ::serde_json::from_value(value).map(Self::Forex),
+                "FUTURE" => ::serde_json::from_value(value).map(Self::Future),
+                "INDEX" => ::serde_json::from_value(value).map(Self::Index),
+                "MUTUAL_FUND" => ::serde_json::from_value(value).map(Self::TransactionMutualFund),
+                "OPTION" => ::serde_json::from_value(value).map(Self::TransactionOption),
+                "PRODUCT" => ::serde_json::from_value(value).map(Self::Product),
+                _ => {
+                    return ::serde_json::from_value::<TransactionCashEquivalent>(value.clone())
+                        .map(Self::TransactionCashEquivalent)
+                        .or_else(|_| {
+                            ::serde_json::from_value::<CollectiveInvestment>(value.clone())
+                                .map(Self::CollectiveInvestment)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<Currency>(value.clone()).map(Self::Currency)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<TransactionEquity>(value.clone())
+                                .map(Self::TransactionEquity)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<TransactionFixedIncome>(value.clone())
+                                .map(Self::TransactionFixedIncome)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<Forex>(value.clone()).map(Self::Forex)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<Future>(value.clone()).map(Self::Future)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<Index>(value.clone()).map(Self::Index)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<TransactionMutualFund>(value.clone())
+                                .map(Self::TransactionMutualFund)
+                        })
+                        .or_else(|_| {
+                            ::serde_json::from_value::<TransactionOption>(value.clone())
+                                .map(Self::TransactionOption)
+                        })
+                        .or_else(|_| ::serde_json::from_value::<Product>(value).map(Self::Product))
+                        .map_err(::serde::de::Error::custom);
+                }
+            };
+            parsed.map_err(::serde::de::Error::custom)
+        }
     }
 
     impl ::std::convert::From<TransactionCashEquivalent> for TransactionInstrument {

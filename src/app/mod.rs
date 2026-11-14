@@ -8,10 +8,11 @@ use self::lots::TaxLotStore;
 use chrono::NaiveDate;
 
 use crate::schwab::{
-    AccountInfo, AccountSummary, AssetType, DataService, Instruction, LotSelectionMethod, Order,
-    Position, Quote, SchwabAuth, SchwabClient, SellLeg, TaxLot, is_long_term,
+    AccountInfo, AccountSummary, AssetType, DataService, ExpirationSlice, ExpiryKind, Instruction,
+    LotSelectionMethod, OptionChainSnapshot, Order, OsiSymbol, Position, PutCall, Quote,
+    SchwabAuth, SchwabClient, SellLeg, TaxLot, find_contract, is_long_term, resolve_expiry,
 };
-use crate::tui::command::{CommandMode, ListNav};
+use crate::tui::command::{CommandMode, ListNav, ParsedCommand};
 
 pub mod lots;
 pub mod operations;
@@ -27,6 +28,8 @@ pub enum Page {
     LotDetail(String),
     /// Operations (corporate actions) management page.
     Operations,
+    /// Option chain for an underlying symbol.
+    OptionChain(String),
 }
 
 /// Messages sent from the background task to the TUI.
@@ -51,6 +54,11 @@ pub enum DataMsg {
     IndexSymbol {
         symbol: String,
         description: String,
+    },
+    /// A fetched option chain snapshot for one underlying.
+    OptionChain {
+        underlying: String,
+        chain: Box<OptionChainSnapshot>,
     },
     /// Backend has switched to a new account. TUI clears stale per-account state
     /// (positions, orders, account info, quotes) and updates the active hash;
@@ -77,13 +85,24 @@ pub enum AppCommand {
         projection: schwab_marketdata::types::GetInstrumentsProjection,
     },
     ClearCmdSymbols,
+    /// Fetch the option chain for an underlying (background task; the snapshot
+    /// arrives as DataMsg::OptionChain).
+    FetchOptionChain {
+        underlying: String,
+    },
+    /// Replace the chain view's live-tick subscription set (OSI symbols of
+    /// the selected row). Declarative: the backend diffs against the current
+    /// option command symbols.
+    SetOptionCmdSymbols(std::collections::HashSet<String>),
     PlaceOrder {
+        /// Equity ticker or OSI option symbol, per `asset_type`.
         symbol: String,
+        asset_type: AssetType,
         instruction: Instruction,
         quantity: f64,
         limit_price: Option<f64>,
         /// Tax lot selection method for sells (auto-selected per leg). `None`
-        /// for buys or when no lots are tracked.
+        /// for buys, options, or when no lots are tracked.
         tax_lot_method: Option<LotSelectionMethod>,
     },
     CancelOrder {
@@ -92,6 +111,7 @@ pub enum AppCommand {
     ReplaceOrder {
         order_id: i64,
         symbol: String,
+        asset_type: AssetType,
         instruction: Instruction,
         quantity: f64,
         limit_price: Option<f64>,
@@ -317,6 +337,137 @@ pub struct AccountPickerState {
     pub selected: usize,
 }
 
+/// Expiration filter for the chain view.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChainExpiryFilter {
+    Weekly,
+    Monthly,
+    Date(NaiveDate),
+}
+
+/// Moneyness row filter, evaluated against the focused side (a call is ITM
+/// below spot; a put above).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoneynessFilter {
+    Atm,
+    Itm,
+    Otm,
+}
+
+/// One strike row of the chain grid: both sides at one strike.
+pub struct ChainRow<'a> {
+    pub strike: f64,
+    pub call: Option<&'a crate::schwab::OptionContract>,
+    pub put: Option<&'a crate::schwab::OptionContract>,
+}
+
+/// TUI state for the option chain page.
+#[derive(Debug)]
+pub struct ChainViewState {
+    /// Index into the filtered expiration list.
+    pub expiration_idx: usize,
+    /// Index into the filtered strike rows.
+    pub strike_idx: usize,
+    /// Which side b/s and the row highlight act on.
+    pub side: PutCall,
+    pub expiry_filter: Option<ChainExpiryFilter>,
+    pub moneyness: Option<MoneynessFilter>,
+    /// Center the selection on the at-the-money strike at next opportunity
+    /// (set on open and when the expiration or filters change).
+    pub center_pending: bool,
+    /// OSI symbols currently subscribed for the selected row (live ticks).
+    pub subscribed: std::collections::HashSet<String>,
+}
+
+impl Default for ChainViewState {
+    fn default() -> Self {
+        Self {
+            expiration_idx: 0,
+            strike_idx: 0,
+            side: PutCall::Call,
+            expiry_filter: None,
+            moneyness: None,
+            center_pending: true,
+            subscribed: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl ChainViewState {
+    /// Expirations passing the current filter, in chronological order.
+    /// Already-expired dates (the API returns them for a while) are dropped.
+    pub fn visible_expirations(&self, chain: &OptionChainSnapshot) -> Vec<NaiveDate> {
+        let today = chrono::Local::now().date_naive();
+        chain
+            .expirations
+            .range(today..)
+            .filter(|(date, slice)| match self.expiry_filter {
+                None => true,
+                Some(ChainExpiryFilter::Weekly) => slice.kind() == ExpiryKind::Weekly,
+                Some(ChainExpiryFilter::Monthly) => slice.kind() == ExpiryKind::Monthly,
+                Some(ChainExpiryFilter::Date(d)) => **date == d,
+            })
+            .map(|(date, _)| *date)
+            .collect()
+    }
+
+    /// The currently selected expiration date, if any pass the filter.
+    pub fn selected_expiration(&self, chain: &OptionChainSnapshot) -> Option<NaiveDate> {
+        let dates = self.visible_expirations(chain);
+        dates
+            .get(self.expiration_idx.min(dates.len().saturating_sub(1)))
+            .copied()
+    }
+
+    /// Strike rows for one expiration: the union of call/put strikes sorted
+    /// ascending, with the moneyness filter applied against the focused side.
+    pub fn rows<'a>(&self, slice: &'a ExpirationSlice, spot: f64) -> Vec<ChainRow<'a>> {
+        // Merge the two ascending strike lists into unioned rows.
+        let mut rows: Vec<ChainRow<'a>> = Vec::new();
+        let (mut ci, mut pi) = (0, 0);
+        while ci < slice.calls.len() || pi < slice.puts.len() {
+            let cs = slice.calls.get(ci).map(|c| c.strike);
+            let ps = slice.puts.get(pi).map(|p| p.strike);
+            let strike = match (cs, ps) {
+                (Some(c), Some(p)) => c.min(p),
+                (Some(c), None) => c,
+                (None, Some(p)) => p,
+                (None, None) => break,
+            };
+            let call = (cs == Some(strike)).then(|| &slice.calls[ci]);
+            let put = (ps == Some(strike)).then(|| &slice.puts[pi]);
+            if call.is_some() {
+                ci += 1;
+            }
+            if put.is_some() {
+                pi += 1;
+            }
+            rows.push(ChainRow { strike, call, put });
+        }
+
+        match self.moneyness {
+            None => rows,
+            Some(MoneynessFilter::Atm) => {
+                // Nearest strikes around spot: 10 below, 10 above.
+                let above = rows.iter().position(|r| r.strike >= spot).unwrap_or(0);
+                let start = above.saturating_sub(10);
+                let end = (above + 11).min(rows.len());
+                rows.into_iter().skip(start).take(end - start).collect()
+            }
+            Some(m) => rows
+                .into_iter()
+                .filter(|r| {
+                    let itm = match self.side {
+                        PutCall::Call => r.strike < spot,
+                        PutCall::Put => r.strike > spot,
+                    };
+                    (m == MoneynessFilter::Itm) == itm
+                })
+                .collect(),
+        }
+    }
+}
+
 /// All state the TUI renders from.
 pub struct AppState {
     pub positions: PositionsState,
@@ -344,6 +495,10 @@ pub struct AppState {
     pub current_account: String,
     /// Account picker overlay state, when open.
     pub account_picker: Option<AccountPickerState>,
+    /// Cached option chain snapshots by underlying, with fetch time.
+    pub chains: HashMap<String, (OptionChainSnapshot, Instant)>,
+    /// Option chain page TUI state.
+    pub chain_view: ChainViewState,
 }
 
 impl AppState {
@@ -370,7 +525,57 @@ impl AppState {
             accounts,
             current_account,
             account_picker: None,
+            chains: HashMap::new(),
+            chain_view: ChainViewState::default(),
         }
+    }
+
+    /// Resolve a typed contract spec to its OSI symbol using cached chains.
+    /// `None` for equity commands; `Some(Err)` while the chain is still
+    /// loading (relative expiries) or the spec can't resolve.
+    pub fn resolve_contract(&self, cmd: &ParsedCommand) -> Option<Result<OsiSymbol, String>> {
+        let contract = cmd.contract.as_ref()?;
+        let chain = self.chains.get(&cmd.symbol).map(|(c, _)| c);
+        let today = chrono::Local::now().date_naive();
+        Some(
+            resolve_expiry(contract.expiry, chain, today).map(|expiration| OsiSymbol {
+                underlying: cmd.symbol.clone(),
+                expiration,
+                put_call: contract.side,
+                strike: contract.strike,
+            }),
+        )
+    }
+
+    /// Best-available quote for an option contract: live stream ticks first,
+    /// falling back to the chain snapshot's prices until the stream catches up.
+    pub fn quote_for_contract(&self, osi: &OsiSymbol) -> Option<Quote> {
+        let osi_str = osi.to_osi_string();
+        if let Some(q) = self.stream.quotes.get(&osi_str)
+            && (q.bid_price > 0.0 || q.ask_price > 0.0)
+        {
+            return Some(q.clone());
+        }
+        let (chain, _) = self.chains.get(&osi.underlying)?;
+        let c = find_contract(chain, osi.expiration, osi.put_call, osi.strike)?;
+        Some(Quote {
+            symbol: osi_str,
+            last_price: c.last,
+            close_price: 0.0,
+            bid_price: c.bid,
+            ask_price: c.ask,
+            bid_size: 0,
+            ask_size: 0,
+            open_price: 0.0,
+            high_price: 0.0,
+            low_price: 0.0,
+            net_change: 0.0,
+            net_percent_change: 0.0,
+            volume: c.volume,
+            mark: c.mark,
+            week_52_high: 0.0,
+            week_52_low: 0.0,
+        })
     }
 
     /// Look up the full AccountSummary for the active account.
@@ -404,11 +609,7 @@ impl AppState {
     ///   3. Otherwise fall back to (last - close) * quantity.
     pub fn pos_metrics(&self, pos: &Position) -> PosMetrics {
         if let Some(q) = self.stream.quotes.get(&pos.symbol) {
-            let multiplier = if pos.asset_type == AssetType::Option {
-                100.0
-            } else {
-                1.0
-            };
+            let multiplier = pos.multiplier;
             let open_pnl = (q.last_price - pos.average_cost) * pos.quantity * multiplier;
             let day_pnl = self.compute_day_pnl(pos, q.last_price, q.close_price, multiplier);
             PosMetrics {
@@ -599,6 +800,9 @@ impl AppState {
                         &mut self.word_index,
                     );
                 }
+            }
+            DataMsg::OptionChain { underlying, chain } => {
+                self.chains.insert(underlying, (*chain, Instant::now()));
             }
             DataMsg::AccountSwitched { hash } => {
                 self.current_account = hash;
@@ -797,10 +1001,113 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schwab::OptionContract;
 
     fn lot(days_ago: i64, qty: f64) -> TaxLot {
         let open = chrono::Local::now().date_naive() - chrono::Duration::days(days_ago);
         TaxLot::new(open, qty, 10.0, 0)
+    }
+
+    fn contract(strike: f64, side: PutCall, kind: ExpiryKind, exp: NaiveDate) -> OptionContract {
+        OptionContract {
+            osi_symbol: format!(
+                "TEST  {}{}{:08}",
+                exp.format("%y%m%d"),
+                if side == PutCall::Call { 'C' } else { 'P' },
+                (strike * 1000.0) as u64
+            ),
+            strike,
+            expiration: exp,
+            put_call: side,
+            expiry_kind: kind,
+            bid: 1.0,
+            ask: 1.2,
+            mark: 1.1,
+            last: 1.1,
+            delta: 0.5,
+            theta: -0.02,
+            iv: 30.0,
+            open_interest: 10,
+            volume: 5,
+            days_to_exp: 5,
+            in_the_money: false,
+        }
+    }
+
+    fn chain_with(kinds: &[(u32, u32, ExpiryKind, &[f64])]) -> OptionChainSnapshot {
+        let mut expirations = BTreeMap::new();
+        for &(m, d, kind, strikes) in kinds {
+            let exp = NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+            let slice = ExpirationSlice {
+                calls: strikes
+                    .iter()
+                    .map(|&s| contract(s, PutCall::Call, kind, exp))
+                    .collect(),
+                puts: strikes
+                    .iter()
+                    .map(|&s| contract(s, PutCall::Put, kind, exp))
+                    .collect(),
+            };
+            expirations.insert(exp, slice);
+        }
+        OptionChainSnapshot {
+            underlying: "TEST".to_string(),
+            underlying_price: 100.0,
+            expirations,
+        }
+    }
+
+    #[test]
+    fn chain_view_expiry_filters() {
+        let chain = chain_with(&[
+            (7, 13, ExpiryKind::Weekly, &[95.0, 100.0, 105.0]),
+            (7, 17, ExpiryKind::Monthly, &[95.0, 100.0, 105.0]),
+        ]);
+        let mut view = ChainViewState::default();
+        assert_eq!(view.visible_expirations(&chain).len(), 2);
+
+        view.expiry_filter = Some(ChainExpiryFilter::Weekly);
+        assert_eq!(
+            view.visible_expirations(&chain),
+            vec![NaiveDate::from_ymd_opt(2026, 7, 13).unwrap()]
+        );
+
+        view.expiry_filter = Some(ChainExpiryFilter::Date(
+            NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+        ));
+        assert_eq!(view.visible_expirations(&chain).len(), 1);
+    }
+
+    #[test]
+    fn chain_view_moneyness_rows() {
+        let chain = chain_with(&[(7, 17, ExpiryKind::Monthly, &[90.0, 100.0, 110.0])]);
+        let slice = &chain.expirations[&NaiveDate::from_ymd_opt(2026, 7, 17).unwrap()];
+        let mut view = ChainViewState::default();
+
+        // Unfiltered: all strikes, both sides populated.
+        let rows = view.rows(slice, 100.0);
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].call.is_some() && rows[0].put.is_some());
+
+        // ITM for calls = strikes below spot.
+        view.moneyness = Some(MoneynessFilter::Itm);
+        let rows = view.rows(slice, 100.0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].strike, 90.0);
+
+        // Flip to puts: ITM = strikes above spot.
+        view.side = PutCall::Put;
+        let rows = view.rows(slice, 100.0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].strike, 110.0);
+
+        // OTM for puts = everything not ITM; the exactly-ATM strike is not
+        // in the money, so it shows on the OTM side.
+        view.moneyness = Some(MoneynessFilter::Otm);
+        let rows = view.rows(slice, 100.0);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].strike, 90.0);
+        assert_eq!(rows[1].strike, 100.0);
     }
 
     #[test]

@@ -34,7 +34,9 @@ fn render_title(f: &mut Frame, area: Rect, state: &AppState) {
     let inactive = Style::default().fg(Color::DarkGray);
 
     let (pos_style, ord_style) = match state.current_page {
-        Page::Positions | Page::LotDetail(_) | Page::Operations => (active, inactive),
+        Page::Positions | Page::LotDetail(_) | Page::Operations | Page::OptionChain(_) => {
+            (active, inactive)
+        }
         Page::Orders => (inactive, active),
     };
 
@@ -90,7 +92,7 @@ fn render_table(f: &mut Frame, area: Rect, state: &AppState) {
                 .unwrap_or_else(|| "--".to_string());
 
             Row::new(vec![
-                Cell::from(order.symbol.clone()),
+                Cell::from(crate::schwab::display_symbol(&order.symbol)),
                 Cell::from(format_instruction(order.instruction)),
                 Cell::from(format_order_type(order.order_type)),
                 Cell::from(format!("{:.0}", order.quantity)),
@@ -105,7 +107,7 @@ fn render_table(f: &mut Frame, area: Rect, state: &AppState) {
         .collect();
 
     let widths = [
-        Constraint::Length(16), // Symbol
+        Constraint::Length(17), // Symbol (compact option form needs up to 17)
         Constraint::Length(8),  // Side
         Constraint::Length(8),  // Type
         Constraint::Length(6),  // Qty
