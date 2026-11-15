@@ -55,7 +55,7 @@ from or written to the working directory except the bundled `stocks.tsv` /
 ## Authentication
 
 `src/schwab/auth.rs` (`SchwabAuth`) owns the OAuth token file and never
-touches stdin or stdout, so the TUI and a future MCP server can share it.
+touches stdin or stdout, so the TUI and the MCP server share it.
 
 - `get_valid_token()` returns the saved token, refreshing the access token
   when it's within 60s of expiring. It never prompts: with no saved login, an
@@ -81,6 +81,28 @@ touches stdin or stdout, so the TUI and a future MCP server can share it.
 - Mid-session, `DataService` treats `LoginRequired` as "tell the user to
   restart and log in" and re-checks the token file every 60s (another process
   may have logged in meanwhile); it never prompts.
+
+## MCP Server
+
+`terminal-trader mcp` (`src/mcp/`) is a separate entry point: `main.rs`
+dispatches to it before anything touches the terminal, sets up file logging,
+and serves MCP on stdio with `rmcp`. It never starts the TUI or `DataService`;
+each tool call makes its REST calls directly through a lazily built
+`SchwabClient` (awaiting inline is fine here, there's no event loop to block).
+
+- `server.rs`: the tools (read-only; there is no order tool). Auth errors
+  become a tool error telling the model to call `login`.
+- `login.rs`: runs `SchwabAuth::login` in a background task so `login` can
+  return the URL immediately. URL elicitation is used when the client
+  advertises it: a server-to-client `elicitation/create` on older protocols,
+  an `InputRequiredResult` (MRTR) round trip on 2026-07-28.
+- `accounts.rs`: nickname labels for accounts and the redaction pass that
+  scrubs account numbers and hashes from every result.
+- `chain.rs` / `format.rs`: filters and compact CSV output.
+
+stdout is the protocol, so nothing reachable from the server may print;
+`mcp::tests::mcp_code_paths_never_print_to_stdout` guards the files involved,
+and the browser opener runs with its output discarded.
 
 ## Startup Sequence
 
