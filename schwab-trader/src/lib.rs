@@ -8751,11 +8751,34 @@ pub mod types {
     ///}
     /// ```
     /// </details>
-    #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
+    #[derive(:: serde :: Serialize, Clone, Debug)]
     #[serde(untagged)]
     pub enum SecuritiesAccount {
         MarginAccount(MarginAccount),
         CashAccount(CashAccount),
+    }
+
+    /// PATCHED (SCHWAB_API_ISSUES #11): the generated impl was
+    /// `#[serde(untagged)]`, and every `CashAccount` field is optional or also
+    /// on `MarginAccount`, so cash accounts deserialized as `MarginAccount`.
+    /// Dispatch on `type` instead; anything else falls back to the old
+    /// first-match order.
+    impl<'de> ::serde::Deserialize<'de> for SecuritiesAccount {
+        fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+        where
+            D: ::serde::Deserializer<'de>,
+        {
+            let value = ::serde_json::Value::deserialize(deserializer)?;
+            let tag = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let parsed = match tag {
+                "CASH" => ::serde_json::from_value(value).map(Self::CashAccount),
+                "MARGIN" => ::serde_json::from_value(value).map(Self::MarginAccount),
+                _ => ::serde_json::from_value::<MarginAccount>(value.clone())
+                    .map(Self::MarginAccount)
+                    .or_else(|_| ::serde_json::from_value(value).map(Self::CashAccount)),
+            };
+            parsed.map_err(::serde::de::Error::custom)
+        }
     }
 
     impl ::std::convert::From<MarginAccount> for SecuritiesAccount {

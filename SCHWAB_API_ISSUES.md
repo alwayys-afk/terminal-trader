@@ -123,3 +123,18 @@ Besides `securitiesAccount`, the response has a top-level
 **Fix:** `schwab-trader`'s `Account` has an `aggregated_balance` field
 (`AggregatedBalance`, liquidation values only). `AccountBalances::from_api`
 prefers `currentLiquidationValue`.
+
+## 11. Cash accounts deserialize as margin accounts
+
+`SecuritiesAccount` is a `oneOf` of `MarginAccount` and `CashAccount`, which
+the generator turned into an untagged enum. Every `CashAccount` field is
+optional or also present on `MarginAccount`, so serde's first match won and
+**every** account, cash ones included, came back as `MarginAccount` (same
+root cause as #6). Found live 2026-11-15: an account whose JSON says
+`"type": "CASH"` was read as margin, with no buying power.
+
+**Fix:** a hand-written `Deserialize` for `SecuritiesAccount` in
+`schwab-trader` that dispatches on `type`. Pinned by
+`cash_accounts_deserialize_as_cash`. Side effect: the TUI's cash figure for a
+cash account is now `cashAvailableForTrading` (the branch `get_positions`
+always meant to use) instead of `cashBalance`.

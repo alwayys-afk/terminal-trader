@@ -681,6 +681,41 @@ mod tests {
     }
 
     #[test]
+    fn cash_accounts_deserialize_as_cash() {
+        // SCHWAB_API_ISSUES #11: untagged matching read every account as margin.
+        let account: tr::Account = serde_json::from_value(serde_json::json!({
+            "aggregatedBalance": {"liquidationValue": 500.0},
+            "securitiesAccount": {
+                "type": "CASH",
+                "currentBalances": {
+                    "cashAvailableForTrading": 120.0,
+                    "cashAvailableForWithdrawal": 100.0,
+                    "unsettledCash": 20.0
+                }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            account.securities_account,
+            Some(tr::SecuritiesAccount::CashAccount(_))
+        ));
+        let b = AccountBalances::from_api(&account);
+        assert_eq!(b.account_type, "CASH");
+        assert_eq!(b.liquidation_value, Some(500.0));
+        assert_eq!(b.buying_power, Some(120.0));
+        assert_eq!(b.unsettled_cash, Some(20.0));
+
+        let margin: tr::Account = serde_json::from_value(serde_json::json!({
+            "securitiesAccount": {"type": "MARGIN", "currentBalances": {"cashBalance": 1.0}}
+        }))
+        .unwrap();
+        assert!(matches!(
+            margin.securities_account,
+            Some(tr::SecuritiesAccount::MarginAccount(_))
+        ));
+    }
+
+    #[test]
     fn expiration_list_uses_expiration_date_on_the_wire() {
         // SCHWAB_API_ISSUES #9: the field is "expirationDate", not "expiration".
         let chain: md::ExpirationChain = serde_json::from_value(serde_json::json!({
