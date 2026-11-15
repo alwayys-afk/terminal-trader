@@ -1606,7 +1606,14 @@ pub mod types {
             skip_serializing_if = "::std::option::Option::is_none"
         )]
         pub days_to_expiration: ::std::option::Option<i32>,
-        #[serde(default, skip_serializing_if = "::std::option::Option::is_none")]
+        // PATCH: API returns "expirationDate", not the documented "expiration"
+        // (SCHWAB_API_ISSUES #9).
+        #[serde(
+            rename = "expirationDate",
+            alias = "expiration",
+            default,
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
         pub expiration: ::std::option::Option<::std::string::String>,
         #[serde(
             rename = "expirationType",
@@ -6465,7 +6472,9 @@ pub mod types {
         )]
         pub intrinsic_value: ::std::option::Option<f64>,
         #[serde(
-            rename = "isInTheMoney",
+            // PATCH: API sends "inTheMoney" (SCHWAB_API_ISSUES #9).
+            rename = "inTheMoney",
+            alias = "isInTheMoney",
             default,
             skip_serializing_if = "::std::option::Option::is_none"
         )]
@@ -6477,19 +6486,25 @@ pub mod types {
         )]
         pub is_index_option: ::std::option::Option<bool>,
         #[serde(
-            rename = "isMini",
+            // PATCH: API sends "mini" (SCHWAB_API_ISSUES #9).
+            rename = "mini",
+            alias = "isMini",
             default,
             skip_serializing_if = "::std::option::Option::is_none"
         )]
         pub is_mini: ::std::option::Option<bool>,
         #[serde(
-            rename = "isNonStandard",
+            // PATCH: API sends "nonStandard" (SCHWAB_API_ISSUES #9).
+            rename = "nonStandard",
+            alias = "isNonStandard",
             default,
             skip_serializing_if = "::std::option::Option::is_none"
         )]
         pub is_non_standard: ::std::option::Option<bool>,
         #[serde(
-            rename = "isPennyPilot",
+            // PATCH: API sends "pennyPilot" (SCHWAB_API_ISSUES #9).
+            rename = "pennyPilot",
+            alias = "isPennyPilot",
             default,
             skip_serializing_if = "::std::option::Option::is_none"
         )]

@@ -10,8 +10,8 @@ use schwab_trader::types as tr;
 
 use super::{
     auth::SchwabAuth,
-    models::{AccountInfo, Order, Position, Quote},
-    options::OptionChainSnapshot,
+    models::{AccountBalances, AccountInfo, Order, Position, Quote},
+    options::{ChainQuery, ExpirationInfo, OptionChainSnapshot, PutCall},
 };
 
 const TRADER_BASE: &str = "https://api.schwabapi.com/trader/v1";
@@ -245,6 +245,20 @@ impl SchwabClient {
         Ok((positions, info))
     }
 
+    /// Balances for one account (no positions).
+    pub async fn get_balances(&self, account_hash: &str) -> Result<AccountBalances> {
+        self.ensure_fresh().await?;
+        let trader = Arc::clone(&self.inner.read().await.trader);
+        let account = trader
+            .get_account()
+            .account_number(account_hash)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .into_inner();
+        Ok(AccountBalances::from_api(&account))
+    }
+
     pub async fn get_quotes(&self, symbols: &[&str]) -> Result<HashMap<String, Quote>> {
         if symbols.is_empty() {
             return Ok(HashMap::new());
@@ -346,6 +360,62 @@ impl SchwabClient {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .into_inner();
         Ok(OptionChainSnapshot::from_api(underlying, chain))
+    }
+
+    /// Fetch an option chain narrowed by `query` (side, strikes around the
+    /// money, expiration range), flattened like [`Self::get_option_chain`].
+    pub async fn get_option_chain_filtered(
+        &self,
+        query: &ChainQuery,
+    ) -> Result<OptionChainSnapshot> {
+        use schwab_marketdata::types::GetChainContractType as Ct;
+        self.ensure_fresh().await?;
+        let marketdata = Arc::clone(&self.inner.read().await.marketdata);
+        let mut req = marketdata
+            .get_chain()
+            .symbol(query.symbol.as_str())
+            .include_underlying_quote(true)
+            .contract_type(match query.side {
+                Some(PutCall::Call) => Ct::Call,
+                Some(PutCall::Put) => Ct::Put,
+                None => Ct::All,
+            });
+        if let Some(n) = query.strike_count {
+            req = req.strike_count(i64::from(n));
+        }
+        if let Some(d) = query.from_date {
+            req = req.from_date(d);
+        }
+        if let Some(d) = query.to_date {
+            req = req.to_date(d);
+        }
+        let chain = req
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .into_inner();
+        Ok(OptionChainSnapshot::from_api(&query.symbol, chain))
+    }
+
+    /// The listed option expirations for an underlying.
+    pub async fn get_expirations(&self, underlying: &str) -> Result<Vec<ExpirationInfo>> {
+        self.ensure_fresh().await?;
+        let marketdata = Arc::clone(&self.inner.read().await.marketdata);
+        let chain = marketdata
+            .get_expiration_chain()
+            .symbol(underlying)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .into_inner();
+        let mut list: Vec<ExpirationInfo> = chain
+            .expiration_list
+            .iter()
+            .filter_map(ExpirationInfo::from_api)
+            .collect();
+        list.sort_by_key(|e| e.date);
+        list.dedup_by_key(|e| e.date);
+        Ok(list)
     }
 
     /// Search for instruments by symbol prefix or description words.
@@ -454,14 +524,23 @@ impl SchwabClient {
         Ok(transactions)
     }
 
+    /// Orders entered in the last 60 days.
     pub async fn get_orders(&self, account_hash: &str) -> Result<Vec<Order>> {
+        let now = chrono::Utc::now();
+        self.get_orders_between(account_hash, now - chrono::Duration::days(60), now)
+            .await
+    }
+
+    /// Orders entered between `from` and `to`.
+    pub async fn get_orders_between(
+        &self,
+        account_hash: &str,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Order>> {
         self.ensure_fresh().await?;
-        let from = (chrono::Utc::now() - chrono::Duration::days(60))
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
-        let to = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let from = from.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        let to = to.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
         let trader = Arc::clone(&self.inner.read().await.trader);
         let orders = trader

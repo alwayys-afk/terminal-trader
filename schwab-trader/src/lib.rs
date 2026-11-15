@@ -58,14 +58,41 @@ pub mod types {
             skip_serializing_if = "::std::option::Option::is_none"
         )]
         pub securities_account: ::std::option::Option<SecuritiesAccount>,
+        // PATCH: the API also returns a top-level `aggregatedBalance`, which
+        // the spec omits (SCHWAB_API_ISSUES #10).
+        #[serde(
+            rename = "aggregatedBalance",
+            default,
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub aggregated_balance: ::std::option::Option<AggregatedBalance>,
     }
 
     impl ::std::default::Default for Account {
         fn default() -> Self {
             Self {
                 securities_account: Default::default(),
+                aggregated_balance: Default::default(),
             }
         }
+    }
+
+    /// PATCH: undocumented `aggregatedBalance` on `GET /accounts/{hash}`
+    /// (SCHWAB_API_ISSUES #10).
+    #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug, Default)]
+    pub struct AggregatedBalance {
+        #[serde(
+            rename = "currentLiquidationValue",
+            default,
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub current_liquidation_value: ::std::option::Option<f64>,
+        #[serde(
+            rename = "liquidationValue",
+            default,
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub liquidation_value: ::std::option::Option<f64>,
     }
 
     impl Account {
@@ -13453,6 +13480,7 @@ pub mod types {
             ) -> ::std::result::Result<Self, super::error::ConversionError> {
                 Ok(Self {
                     securities_account: value.securities_account?,
+                    aggregated_balance: None,
                 })
             }
         }
