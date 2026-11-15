@@ -2129,3 +2129,158 @@ async fn test_get_transactions_two_years_chunked() {
     );
     assert!(two_years.len() >= one_year.len());
 }
+
+/// `GET /expirationchain` (SCHWAB_API_ISSUES #9: dates arrive as
+/// `expirationDate`). Every entry must parse to a date.
+#[tokio::test]
+#[ignore]
+async fn test_get_expirations() {
+    let Some((client, _)) = setup().await else {
+        return;
+    };
+    let list = client
+        .get_expirations("SPY")
+        .await
+        .expect("get_expirations failed");
+    println!(
+        "SPY: {} expirations, first {:?}",
+        list.len(),
+        list.first().map(|e| (e.date, e.days_to_exp, e.kind))
+    );
+    assert!(list.len() > 10, "SPY lists many expirations");
+    let today = chrono::Local::now().date_naive();
+    assert!(list.iter().all(|e| e.date >= today));
+    assert!(list.windows(2).all(|w| w[0].date < w[1].date), "sorted");
+    assert!(
+        list.iter()
+            .any(|e| e.kind == terminal_trader::schwab::ExpiryKind::Monthly),
+        "has a standard monthly"
+    );
+}
+
+/// `GET /chains` with strikeCount/contractType/date filters, and the greeks
+/// the MCP server reports (gamma, vega, theoretical value).
+#[tokio::test]
+#[ignore]
+async fn test_get_chain_filtered_has_greeks() {
+    use terminal_trader::schwab::{ChainQuery, PutCall};
+    let Some((client, _)) = setup().await else {
+        return;
+    };
+    let today = chrono::Local::now().date_naive();
+    let query = ChainQuery {
+        symbol: "SPY".to_string(),
+        side: Some(PutCall::Call),
+        strike_count: Some(4),
+        from_date: Some(today),
+        to_date: Some(today + chrono::Duration::days(21)),
+    };
+    let snap = client
+        .get_option_chain_filtered(&query)
+        .await
+        .expect("get_option_chain_filtered failed");
+    println!(
+        "SPY calls: underlying={:.2} expirations={} contracts={}",
+        snap.underlying_price,
+        snap.expirations.len(),
+        snap.contract_count()
+    );
+    assert!(snap.underlying_price > 0.0);
+    assert!(!snap.expirations.is_empty());
+    for (exp, slice) in &snap.expirations {
+        assert!(*exp <= today + chrono::Duration::days(21));
+        assert!(slice.puts.is_empty(), "asked for calls only");
+        assert!(
+            slice.calls.len() <= 4,
+            "strikeCount=4 returns at most 4 strikes, got {}",
+            slice.calls.len()
+        );
+    }
+    let all: Vec<_> = snap
+        .expirations
+        .values()
+        .flat_map(|s| s.calls.iter())
+        .collect();
+    let c = all[0];
+    println!(
+        "sample {} delta={} gamma={:?} theta={} vega={:?} rho={:?} theo={:?} iv={} itm={}",
+        c.osi_symbol, c.delta, c.gamma, c.theta, c.vega, c.rho, c.theo_value, c.iv, c.in_the_money
+    );
+    // Greeks are present and plausible for liquid near-the-money calls.
+    for c in &all {
+        let g = c.gamma.expect("gamma present");
+        let v = c.vega.expect("vega present");
+        let t = c.theo_value.expect("theoretical value present");
+        assert!((0.0..1.0).contains(&g), "gamma {g}");
+        assert!(v >= 0.0, "vega {v}");
+        assert!(t >= 0.0, "theo {t}");
+        assert!((0.0..=1.0).contains(&c.delta), "call delta {}", c.delta);
+    }
+    // With strikes on both sides of the money, some calls are ITM
+    // (SCHWAB_API_ISSUES #9: the flag is `inTheMoney`).
+    assert!(all.iter().any(|c| c.in_the_money), "some calls are ITM");
+    assert!(all.iter().any(|c| !c.in_the_money), "some calls are OTM");
+    for c in &all {
+        assert_eq!(
+            c.in_the_money,
+            c.strike < snap.underlying_price,
+            "ITM flag for strike {}",
+            c.strike
+        );
+    }
+}
+
+/// `GET /accounts/{hash}` without positions, including the undocumented
+/// `aggregatedBalance` (SCHWAB_API_ISSUES #10). Prints only which fields are
+/// present, never the amounts.
+#[tokio::test]
+#[ignore]
+async fn test_get_balances() {
+    let Some((client, _)) = setup().await else {
+        return;
+    };
+    let accounts = client.get_accounts().await.expect("get_accounts failed");
+    for (i, acct) in accounts.iter().enumerate() {
+        let b = client
+            .get_balances(&acct.hash)
+            .await
+            .expect("get_balances failed");
+        println!(
+            "account {i}: type={} liquidation={} cash={} buying_power={}",
+            b.account_type,
+            b.liquidation_value.is_some(),
+            b.cash.is_some(),
+            b.buying_power.is_some()
+        );
+        assert!(b.account_type == "MARGIN" || b.account_type == "CASH");
+        assert!(b.liquidation_value.is_some(), "liquidation value present");
+        assert!(b.buying_power.is_some(), "buying power present");
+    }
+}
+
+/// `GET /accounts/{hash}/orders` over a caller-chosen range (the MCP
+/// `get_orders` tool).
+#[tokio::test]
+#[ignore]
+async fn test_get_orders_between() {
+    let Some((client, hash)) = setup().await else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    let week = client
+        .get_orders_between(&hash, now - chrono::Duration::days(7), now)
+        .await
+        .expect("get_orders_between failed");
+    let sixty = client
+        .get_orders_between(&hash, now - chrono::Duration::days(60), now)
+        .await
+        .expect("get_orders_between (60d) failed");
+    println!(
+        "orders: {} in 7 days, {} in 60 days",
+        week.len(),
+        sixty.len()
+    );
+    assert!(week.len() <= sixty.len());
+    let cutoff = now - chrono::Duration::days(7) - chrono::Duration::minutes(5);
+    assert!(week.iter().all(|o| o.entered_time >= cutoff));
+}
