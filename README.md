@@ -22,6 +22,9 @@ A fast, keyboard-driven terminal (TUI) trading client for the
 - **Account P&L** — aggregate short-/long-term realized P&L broken out by year.
 - **Multi-account** — switch between accounts; configurable per-account
   default lot method.
+- **MCP server** — `terminal-trader mcp` gives Claude (or any MCP client)
+  read-only access to your accounts, quotes and option chains. See
+  [MCP server](#mcp-server).
 
 ## Architecture
 
@@ -90,6 +93,74 @@ to copy or paste.
 - Several processes can share the token file: refreshes take a lock
   (`schwab_tokens.json.lock`) and saves are atomic, so two copies of the app
   never refresh over each other.
+
+## MCP server
+
+`terminal-trader mcp` runs a local [MCP](https://modelcontextprotocol.io)
+server over stdio, so an AI assistant can look at your accounts and help you
+think through trades, especially option pricing. It's **read-only**: no tool
+can place, change or cancel an order.
+
+| Tool | Returns |
+| --- | --- |
+| `auth_status` | Whether there's a usable login, and when it expires |
+| `login` | Runs the browser login (below) |
+| `list_accounts` | Account nicknames |
+| `get_positions` | Positions with day and open P&L |
+| `get_balances` | Liquidation value, cash, buying power, margin figures |
+| `get_orders` | Orders, filtered by status and date (last 7 days by default) |
+| `get_quotes` | Quotes for up to 50 symbols |
+| `get_lots` | Open tax lots with short/long-term status, days to long-term and unrealized gain |
+| `get_expirations` | Listed option expirations |
+| `get_option_chain` | A filtered chain (expiration range, strikes around the money, calls/puts) with IV, delta, gamma, theta, vega and Schwab's theoretical value |
+
+Output is compact CSV, since all of it lands in the model's context. Chains
+default to 45 days and 8 strikes each side of the money and are capped at 120
+rows (a `TRUNCATED` line says how many more matched).
+
+**Register it** with Claude Code (build first with `cargo build --release`):
+
+```sh
+claude mcp add terminal-trader -- /path/to/terminal-trader/target/release/terminal-trader mcp
+```
+
+or in Claude Desktop's `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "terminal-trader": {
+      "command": "/path/to/terminal-trader/target/release/terminal-trader",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+It uses the same `.env`, token file and lot files as the app, so set up and log
+in as above first.
+
+**Logging in.** The server never prompts on its own; tools say when a login is
+needed, and the `login` tool runs the same browser login as the app (callback
+on `https://127.0.0.1:8182`, same certificate warning, 5-minute window). If the
+client supports MCP URL elicitation, it shows you the link and the tool waits
+for you to finish. Otherwise the tool opens your browser, returns the link
+right away, and the assistant calls `login` with `wait=true` once you say
+you're done. The app and the server share the token file safely, but only one
+login can listen on port 8182 at a time.
+
+**Privacy.** Accounts appear only by their Schwab nickname (or "Account 1",
+"Account 2", ... when none is set). Account numbers and hashes stay inside the
+server, and every tool result is scrubbed for them before it's returned. Your
+positions, balances and orders do go to the AI client you connect, so use one
+you trust with that. Logs go to `trader.log`; stdout carries only the protocol.
+
+Tax lots come from the lot files the app keeps; they're as current as the last
+time the app synced (shown in the output). Options aren't tracked as lots.
+
+Planned: setup help (`setup_status`, prefs), pricing tools (price history,
+what-if chains, a multi-leg P&L and greeks calculator), and, off by default,
+order preview and placement with per-order limits.
 
 ## Contributing
 

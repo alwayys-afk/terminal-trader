@@ -58,14 +58,41 @@ pub mod types {
             skip_serializing_if = "::std::option::Option::is_none"
         )]
         pub securities_account: ::std::option::Option<SecuritiesAccount>,
+        // PATCH: the API also returns a top-level `aggregatedBalance`, which
+        // the spec omits (SCHWAB_API_ISSUES #10).
+        #[serde(
+            rename = "aggregatedBalance",
+            default,
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub aggregated_balance: ::std::option::Option<AggregatedBalance>,
     }
 
     impl ::std::default::Default for Account {
         fn default() -> Self {
             Self {
                 securities_account: Default::default(),
+                aggregated_balance: Default::default(),
             }
         }
+    }
+
+    /// PATCH: undocumented `aggregatedBalance` on `GET /accounts/{hash}`
+    /// (SCHWAB_API_ISSUES #10).
+    #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug, Default)]
+    pub struct AggregatedBalance {
+        #[serde(
+            rename = "currentLiquidationValue",
+            default,
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub current_liquidation_value: ::std::option::Option<f64>,
+        #[serde(
+            rename = "liquidationValue",
+            default,
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub liquidation_value: ::std::option::Option<f64>,
     }
 
     impl Account {
@@ -8724,11 +8751,34 @@ pub mod types {
     ///}
     /// ```
     /// </details>
-    #[derive(:: serde :: Deserialize, :: serde :: Serialize, Clone, Debug)]
+    #[derive(:: serde :: Serialize, Clone, Debug)]
     #[serde(untagged)]
     pub enum SecuritiesAccount {
         MarginAccount(MarginAccount),
         CashAccount(CashAccount),
+    }
+
+    /// PATCHED (SCHWAB_API_ISSUES #11): the generated impl was
+    /// `#[serde(untagged)]`, and every `CashAccount` field is optional or also
+    /// on `MarginAccount`, so cash accounts deserialized as `MarginAccount`.
+    /// Dispatch on `type` instead; anything else falls back to the old
+    /// first-match order.
+    impl<'de> ::serde::Deserialize<'de> for SecuritiesAccount {
+        fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+        where
+            D: ::serde::Deserializer<'de>,
+        {
+            let value = ::serde_json::Value::deserialize(deserializer)?;
+            let tag = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let parsed = match tag {
+                "CASH" => ::serde_json::from_value(value).map(Self::CashAccount),
+                "MARGIN" => ::serde_json::from_value(value).map(Self::MarginAccount),
+                _ => ::serde_json::from_value::<MarginAccount>(value.clone())
+                    .map(Self::MarginAccount)
+                    .or_else(|_| ::serde_json::from_value(value).map(Self::CashAccount)),
+            };
+            parsed.map_err(::serde::de::Error::custom)
+        }
     }
 
     impl ::std::convert::From<MarginAccount> for SecuritiesAccount {
@@ -13453,6 +13503,7 @@ pub mod types {
             ) -> ::std::result::Result<Self, super::error::ConversionError> {
                 Ok(Self {
                     securities_account: value.securities_account?,
+                    aggregated_balance: None,
                 })
             }
         }

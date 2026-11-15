@@ -214,6 +214,82 @@ impl AccountSummary {
     }
 }
 
+/// The balance figures worth showing for an account, from `GET /accounts/{hash}`.
+/// Fields Schwab doesn't send for the account type are `None`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccountBalances {
+    /// `MARGIN` or `CASH`.
+    pub account_type: &'static str,
+    pub liquidation_value: Option<f64>,
+    /// Net cash: on margin accounts `cashBalance + marginBalance`, matching
+    /// [`AccountInfo::cash_balance`]; on cash accounts cash available for
+    /// trading.
+    pub cash: Option<f64>,
+    pub buying_power: Option<f64>,
+    pub option_buying_power: Option<f64>,
+    pub day_trading_buying_power: Option<f64>,
+    pub available_funds: Option<f64>,
+    pub equity: Option<f64>,
+    pub maintenance_requirement: Option<f64>,
+    pub margin_balance: Option<f64>,
+    pub cash_available_for_withdrawal: Option<f64>,
+    pub unsettled_cash: Option<f64>,
+    pub in_call: bool,
+}
+
+impl AccountBalances {
+    pub fn from_api(account: &tr::Account) -> AccountBalances {
+        let aggregated = account
+            .aggregated_balance
+            .as_ref()
+            .and_then(|a| a.current_liquidation_value.or(a.liquidation_value));
+        match &account.securities_account {
+            Some(tr::SecuritiesAccount::MarginAccount(a)) => {
+                let cur = a.current_balances.clone().unwrap_or_default();
+                let proj = a.projected_balances.clone().unwrap_or_default();
+                let cash = match (cur.cash_balance, cur.margin_balance) {
+                    (None, None) => None,
+                    (c, m) => Some(c.unwrap_or(0.0) + m.unwrap_or(0.0)),
+                };
+                AccountBalances {
+                    account_type: "MARGIN",
+                    liquidation_value: aggregated.or(cur.liquidation_value),
+                    cash,
+                    buying_power: proj.buying_power.or(cur.buying_power),
+                    option_buying_power: proj.option_buying_power.or(cur.option_buying_power),
+                    day_trading_buying_power: proj
+                        .day_trading_buying_power
+                        .or(cur.day_trading_buying_power),
+                    available_funds: proj.available_funds.or(cur.available_funds),
+                    equity: cur.equity,
+                    maintenance_requirement: cur.maintenance_requirement,
+                    margin_balance: cur.margin_balance,
+                    cash_available_for_withdrawal: None,
+                    unsettled_cash: None,
+                    in_call: proj.is_in_call.or(cur.is_in_call).unwrap_or(false),
+                }
+            }
+            Some(tr::SecuritiesAccount::CashAccount(a)) => {
+                let cur = a.current_balances.clone().unwrap_or_default();
+                let initial = a.initial_balances.clone().unwrap_or_default();
+                AccountBalances {
+                    account_type: "CASH",
+                    liquidation_value: aggregated.or(initial.liquidation_value),
+                    cash: cur.cash_available_for_trading,
+                    buying_power: cur.cash_available_for_trading,
+                    cash_available_for_withdrawal: cur.cash_available_for_withdrawal,
+                    unsettled_cash: cur.unsettled_cash,
+                    ..Default::default()
+                }
+            }
+            None => AccountBalances {
+                liquidation_value: aggregated,
+                ..Default::default()
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: String,
@@ -576,6 +652,85 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(cur, tr::TransactionInstrument::Currency(_)));
+    }
+
+    #[test]
+    fn balances_from_margin_account_with_aggregated_balance() {
+        // Wire shape seen live (values are made up).
+        let account: tr::Account = serde_json::from_value(serde_json::json!({
+            "aggregatedBalance": {"currentLiquidationValue": 1500.5, "liquidationValue": 1490.0},
+            "securitiesAccount": {
+                "type": "MARGIN",
+                "accountNumber": "TEST-ACCT",
+                "currentBalances": {
+                    "cashBalance": 300.0, "marginBalance": -100.0,
+                    "liquidationValue": 1400.0, "equity": 1300.0,
+                    "maintenanceRequirement": 250.0, "buyingPower": 900.0
+                },
+                "projectedBalances": {"buyingPower": 950.0, "isInCall": false}
+            }
+        }))
+        .unwrap();
+        let b = AccountBalances::from_api(&account);
+        assert_eq!(b.account_type, "MARGIN");
+        assert_eq!(b.liquidation_value, Some(1500.5));
+        assert_eq!(b.cash, Some(200.0));
+        assert_eq!(b.buying_power, Some(950.0));
+        assert_eq!(b.maintenance_requirement, Some(250.0));
+        assert!(!b.in_call);
+    }
+
+    #[test]
+    fn cash_accounts_deserialize_as_cash() {
+        // SCHWAB_API_ISSUES #11: untagged matching read every account as margin.
+        let account: tr::Account = serde_json::from_value(serde_json::json!({
+            "aggregatedBalance": {"liquidationValue": 500.0},
+            "securitiesAccount": {
+                "type": "CASH",
+                "currentBalances": {
+                    "cashAvailableForTrading": 120.0,
+                    "cashAvailableForWithdrawal": 100.0,
+                    "unsettledCash": 20.0
+                }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            account.securities_account,
+            Some(tr::SecuritiesAccount::CashAccount(_))
+        ));
+        let b = AccountBalances::from_api(&account);
+        assert_eq!(b.account_type, "CASH");
+        assert_eq!(b.liquidation_value, Some(500.0));
+        assert_eq!(b.buying_power, Some(120.0));
+        assert_eq!(b.unsettled_cash, Some(20.0));
+
+        let margin: tr::Account = serde_json::from_value(serde_json::json!({
+            "securitiesAccount": {"type": "MARGIN", "currentBalances": {"cashBalance": 1.0}}
+        }))
+        .unwrap();
+        assert!(matches!(
+            margin.securities_account,
+            Some(tr::SecuritiesAccount::MarginAccount(_))
+        ));
+    }
+
+    #[test]
+    fn expiration_list_uses_expiration_date_on_the_wire() {
+        // SCHWAB_API_ISSUES #9: the field is "expirationDate", not "expiration".
+        let chain: md::ExpirationChain = serde_json::from_value(serde_json::json!({
+            "expirationList": [{
+                "daysToExpiration": 1, "expirationDate": "2026-11-16",
+                "expirationType": "W", "optionRoots": "TEST",
+                "settlementType": "P", "standard": true
+            }],
+            "status": null
+        }))
+        .unwrap();
+        assert_eq!(
+            chain.expiration_list[0].expiration.as_deref(),
+            Some("2026-11-16")
+        );
     }
 
     #[test]

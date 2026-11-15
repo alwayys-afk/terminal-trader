@@ -93,3 +93,48 @@ Verified live 2026-11-14: a range of 365 days succeeds, 366 days returns 400
 into consecutive 364-day windows and merges the results by `activityId`.
 This matters for the first sync of an account with no lot file (a 24-month
 fetch) and for an incremental sync after more than a year without trades.
+
+## 9. Field names in the option chain and expiration chain don't match the spec
+
+Verified live 2026-11-15 against `GET /chains` and `GET /expirationchain`:
+
+- Option contracts send `inTheMoney`, `mini`, `nonStandard` and `pennyPilot`;
+  the spec documents `isInTheMoney`, `isMini`, `isNonStandard` and
+  `isPennyPilot`. With the spec names the SDK silently read every contract as
+  out of the money.
+- Each entry of `expirationList` sends its date as `expirationDate`; the spec
+  documents `expiration`, so the SDK read every date as missing.
+
+**Fix:** the generated `schwab-marketdata` types rename these fields to the
+wire names (keeping the spec names as serde aliases). Covered by
+`keeps_gamma_vega_theo_and_drops_sentinels`,
+`expiration_list_uses_expiration_date_on_the_wire` and the live tests
+`test_get_expirations` / `test_get_chain_filtered_has_greeks`.
+
+## 10. `GET /accounts/{hash}` returns an undocumented `aggregatedBalance`
+
+Besides `securitiesAccount`, the response has a top-level
+`aggregatedBalance` object with `currentLiquidationValue`,
+`liquidationValue`, `intradayBuyingPowerAmount` and
+`currentIntradayBuyingPowerAmount`. The spec's `Account` schema only has
+`securitiesAccount`. Cash accounts have no liquidation value in
+`currentBalances`, so this is the only place to get it intraday.
+
+**Fix:** `schwab-trader`'s `Account` has an `aggregated_balance` field
+(`AggregatedBalance`, liquidation values only). `AccountBalances::from_api`
+prefers `currentLiquidationValue`.
+
+## 11. Cash accounts deserialize as margin accounts
+
+`SecuritiesAccount` is a `oneOf` of `MarginAccount` and `CashAccount`, which
+the generator turned into an untagged enum. Every `CashAccount` field is
+optional or also present on `MarginAccount`, so serde's first match won and
+**every** account, cash ones included, came back as `MarginAccount` (same
+root cause as #6). Found live 2026-11-15: an account whose JSON says
+`"type": "CASH"` was read as margin, with no buying power.
+
+**Fix:** a hand-written `Deserialize` for `SecuritiesAccount` in
+`schwab-trader` that dispatches on `type`. Pinned by
+`cash_accounts_deserialize_as_cash`. Side effect: the TUI's cash figure for a
+cash account is now `cashAvailableForTrading` (the branch `get_positions`
+always meant to use) instead of `cashBalance`.

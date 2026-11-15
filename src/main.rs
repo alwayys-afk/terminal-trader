@@ -10,6 +10,13 @@ async fn main() -> Result<()> {
     // Handle --seed before setting up TUI logging.
     // Usage: --seed <csv> [--lot-method <fifo|lifo|hifo>]
     let args: Vec<String> = std::env::args().collect();
+
+    // `terminal-trader mcp`: MCP server on stdio. stdout is the protocol, so
+    // nothing may print there; logs go to trader.log.
+    if args.get(1).map(String::as_str) == Some("mcp") {
+        init_file_logging()?;
+        return terminal_trader::mcp::serve_stdio().await;
+    }
     if args.len() >= 3 && args[1] == "--seed" {
         use terminal_trader::schwab::LotSelectionMethod;
         let csv_path = args[2].clone();
@@ -27,6 +34,13 @@ async fn main() -> Result<()> {
     }
 
     // Log to file so it doesn't interfere with the TUI.
+    init_file_logging()?;
+    terminal_trader::app::run().await
+}
+
+/// Send `tracing` output to `<data dir>/trader.log`. The TUI owns the
+/// terminal and the MCP server owns stdout, so neither may log there.
+fn init_file_logging() -> Result<()> {
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -39,6 +53,5 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("terminal_trader=info")),
         )
         .init();
-
-    terminal_trader::app::run().await
+    Ok(())
 }

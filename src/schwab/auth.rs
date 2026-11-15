@@ -168,6 +168,16 @@ impl SchwabAuth {
         self.refresh_access_token(&token).await
     }
 
+    /// When the saved access and refresh tokens expire, read from the token
+    /// file without refreshing or prompting. `None` when there is no readable
+    /// saved login.
+    pub fn saved_token_expiry(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.store
+            .load()
+            .ok()
+            .map(|t| (t.expires_at, t.refresh_expires_at))
+    }
+
     /// Run the browser login: start the HTTPS callback listener, hand the
     /// authorize URL to `on_url` (to print or open), wait for Schwab's
     /// redirect, exchange the code and save the token.

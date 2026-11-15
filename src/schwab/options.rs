@@ -34,7 +34,7 @@ pub enum ExpiryKind {
 }
 
 impl ExpiryKind {
-    fn from_api(t: Option<md::ExpirationType>) -> ExpiryKind {
+    pub(crate) fn from_api(t: Option<md::ExpirationType>) -> ExpiryKind {
         match t {
             Some(md::ExpirationType::W) => ExpiryKind::Weekly,
             Some(md::ExpirationType::S) => ExpiryKind::Monthly,
@@ -61,6 +61,14 @@ pub struct OptionContract {
     pub last: f64,
     pub delta: f64,
     pub theta: f64,
+    /// Greeks and model values the TUI doesn't show yet (the MCP server
+    /// does). `None` when Schwab omits the field or sends its -999 "not
+    /// available" sentinel.
+    pub gamma: Option<f64>,
+    pub vega: Option<f64>,
+    pub rho: Option<f64>,
+    /// Schwab's theoretical option value.
+    pub theo_value: Option<f64>,
     /// Implied volatility (the chain's `volatility` field), as a percentage.
     pub iv: f64,
     pub open_interest: i64,
@@ -91,6 +99,10 @@ impl OptionContract {
             last: c.last_price.unwrap_or(0.0),
             delta: c.delta.unwrap_or(0.0),
             theta: c.theta.unwrap_or(0.0),
+            gamma: available(c.gamma),
+            vega: available(c.vega),
+            rho: available(c.rho),
+            theo_value: available(c.theoretical_option_value),
             iv: c.volatility.unwrap_or(0.0),
             open_interest: c.open_interest.unwrap_or(0.0) as i64,
             volume: c.total_volume.unwrap_or(0) as i64,
@@ -98,6 +110,11 @@ impl OptionContract {
             in_the_money: c.is_in_the_money.unwrap_or(false),
         })
     }
+}
+
+/// Schwab sends -999 (and occasionally NaN) for greeks it can't compute.
+fn available(v: Option<f64>) -> Option<f64> {
+    v.filter(|x| x.is_finite() && *x > -999.0 + 1e-9)
 }
 
 /// Calls and puts for one expiration date, each sorted by strike ascending.
@@ -154,6 +171,47 @@ impl OptionChainSnapshot {
             .map(|s| s.calls.len() + s.puts.len())
             .sum()
     }
+}
+
+// ── Expirations and chain queries ────────────────────────────────────────────
+
+/// One listed expiration from `GET /expirationchain`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpirationInfo {
+    pub date: NaiveDate,
+    pub days_to_exp: i32,
+    pub kind: ExpiryKind,
+    /// False for non-standard (adjusted-deliverable) roots.
+    pub standard: bool,
+}
+
+impl ExpirationInfo {
+    pub fn from_api(e: &md::Expiration) -> Option<ExpirationInfo> {
+        let date = e
+            .expiration
+            .as_deref()
+            .and_then(|d| NaiveDate::parse_from_str(d.get(..10)?, "%Y-%m-%d").ok())?;
+        Some(ExpirationInfo {
+            date,
+            days_to_exp: e.days_to_expiration.unwrap_or(0),
+            kind: ExpiryKind::from_api(e.expiration_type),
+            standard: e.standard.unwrap_or(true),
+        })
+    }
+}
+
+/// Server-side filters for `GET /chains`, so a chain request doesn't pull
+/// every strike of every expiration.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChainQuery {
+    pub symbol: String,
+    /// `None` for both calls and puts.
+    pub side: Option<PutCall>,
+    /// Strikes above and below the at-the-money strike (Schwab's
+    /// `strikeCount`).
+    pub strike_count: Option<u32>,
+    pub from_date: Option<NaiveDate>,
+    pub to_date: Option<NaiveDate>,
 }
 
 // ── Contract specs (typed commands / chain filters) ──────────────────────────
@@ -486,6 +544,30 @@ mod tests {
     }
 
     #[test]
+    fn keeps_gamma_vega_theo_and_drops_sentinels() {
+        // Wire field names, as the live API sends them (SCHWAB_API_ISSUES #9).
+        let c: md::OptionContract = serde_json::from_value(serde_json::json!({
+            "symbol": "TEST  260619C00100000",
+            "putCall": "CALL",
+            "strikePrice": 100.0,
+            "delta": 0.52,
+            "gamma": 0.031,
+            "vega": 0.12,
+            "rho": -999.0,
+            "theoreticalOptionValue": 2.35,
+            "inTheMoney": true
+        }))
+        .unwrap();
+        let exp = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
+        let parsed = OptionContract::from_api(&c, exp).unwrap();
+        assert_eq!(parsed.gamma, Some(0.031));
+        assert_eq!(parsed.vega, Some(0.12));
+        assert_eq!(parsed.theo_value, Some(2.35));
+        assert_eq!(parsed.rho, None, "-999 means not available");
+        assert!(parsed.in_the_money);
+    }
+
+    #[test]
     fn skips_contracts_missing_required_fields() {
         // No symbol → dropped; no put_call → dropped.
         let mut calls = HashMap::new();
@@ -531,6 +613,10 @@ mod tests {
                 last: 1.1,
                 delta: 0.5,
                 theta: -0.02,
+                gamma: None,
+                vega: None,
+                rho: None,
+                theo_value: None,
                 iv: 30.0,
                 open_interest: 10,
                 volume: 5,
