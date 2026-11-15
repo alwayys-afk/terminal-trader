@@ -2080,3 +2080,52 @@ async fn test_equity_sell_tax_lot_method_echo() {
     );
     println!(">>> CONFIRMED: equity sell echoes tax_lot_method = FIFO. Share round-tripped.");
 }
+
+/// Schwab rejects transaction ranges over 365 days (SCHWAB_API_ISSUES #8).
+/// Probes the limit with a raw single-window request, then checks that a
+/// two-year fetch through `get_transactions_by_type` (which chunks) succeeds.
+///
+///   cargo test test_get_transactions_two_years_chunked -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn test_get_transactions_two_years_chunked() {
+    let Some((client, hash)) = setup().await else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    let trade = schwab_trader::types::TransactionType::Trade;
+
+    // Raw request for 366 days: Schwab should still reject it. If this
+    // starts passing, the limit changed; update SCHWAB_API_ISSUES #8.
+    let fmt = |dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let raw = client
+        .trader()
+        .await
+        .get_transactions_by_path_param()
+        .account_number(&hash)
+        .start_date(fmt(now - chrono::Duration::days(366)))
+        .end_date(fmt(now))
+        .types(trade)
+        .send()
+        .await;
+    println!("probe: raw 366-day request ok={}", raw.is_ok());
+    assert!(
+        raw.is_err(),
+        "366-day range accepted; limit changed (SCHWAB_API_ISSUES #8)"
+    );
+
+    let one_year = client
+        .get_transactions_by_type(&hash, now - chrono::Duration::days(364), now, trade)
+        .await
+        .expect("one-year fetch failed");
+    let two_years = client
+        .get_transactions_by_type(&hash, now - chrono::Months::new(24), now, trade)
+        .await
+        .expect("two-year chunked fetch failed");
+    println!(
+        "one year: {} txns, two years: {} txns",
+        one_year.len(),
+        two_years.len()
+    );
+    assert!(two_years.len() >= one_year.len());
+}

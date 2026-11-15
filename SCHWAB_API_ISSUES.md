@@ -81,3 +81,15 @@ or so after expiry — filter them out client-side.
 
 No way to trade EXTO?
 Is there any documentation on how wash sales work
+
+## 8. Transactions endpoint rejects date ranges longer than 365 days
+
+`GET /accounts/{accountNumber}/transactions` returns `400 Bad Request` when
+`endDate - startDate` exceeds 365 days. The spec doesn't document a limit.
+Verified live 2026-11-14: a range of 365 days succeeds, 366 days returns 400
+(`probe` in `test_get_transactions_two_years_chunked`).
+
+**Workaround:** `SchwabClient::get_transactions_by_type` splits longer ranges
+into consecutive 364-day windows and merges the results by `activityId`.
+This matters for the first sync of an account with no lot file (a 24-month
+fetch) and for an incremental sync after more than a year without trades.

@@ -385,14 +385,10 @@ impl SchwabClient {
         transaction_type: tr::TransactionType,
     ) -> Result<Vec<tr::Transaction>> {
         let mut map = HashMap::new();
-        self.collect_transactions(
-            account_hash,
-            start_date,
-            end_date,
-            transaction_type,
-            &mut map,
-        )
-        .await?;
+        for (start, end) in transaction_windows(start_date, end_date) {
+            self.collect_transactions(account_hash, start, end, transaction_type, &mut map)
+                .await?;
+        }
         Ok(map.into_values().collect())
     }
 
@@ -616,4 +612,62 @@ fn authed_reqwest(access_token: &str) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .default_headers(headers)
         .build()?)
+}
+
+/// Schwab rejects a transactions request spanning more than 365 days with a
+/// 400 (SCHWAB_API_ISSUES #8), so longer ranges are fetched in windows of
+/// this length (a day of margin under the limit).
+const MAX_TRANSACTION_WINDOW_DAYS: i64 = 364;
+
+/// Split `start..end` into consecutive windows Schwab will accept. Returns
+/// the range unchanged when it already fits, and nothing when it is empty.
+fn transaction_windows(
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    let step = chrono::Duration::days(MAX_TRANSACTION_WINDOW_DAYS);
+    let mut windows = Vec::new();
+    let mut from = start;
+    while from < end {
+        let to = (from + step).min(end);
+        windows.push((from, to));
+        from = to;
+    }
+    windows
+}
+
+#[cfg(test)]
+mod transaction_window_tests {
+    use super::*;
+    use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn short_range_is_one_window() {
+        let start = Utc.with_ymd_and_hms(2026, 11, 1, 0, 0, 0).unwrap();
+        let end = start + Duration::days(3);
+        assert_eq!(transaction_windows(start, end), vec![(start, end)]);
+    }
+
+    #[test]
+    fn two_years_splits_into_contiguous_windows_under_the_limit() {
+        let end = Utc.with_ymd_and_hms(2026, 11, 15, 3, 0, 0).unwrap();
+        let start = end - chrono::Months::new(24);
+        let windows = transaction_windows(start, end);
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows.first().unwrap().0, start);
+        assert_eq!(windows.last().unwrap().1, end);
+        for pair in windows.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "windows must be contiguous");
+        }
+        for (from, to) in &windows {
+            assert!(*to - *from <= Duration::days(MAX_TRANSACTION_WINDOW_DAYS));
+        }
+    }
+
+    #[test]
+    fn empty_or_inverted_range_has_no_windows() {
+        let t = Utc.with_ymd_and_hms(2026, 11, 15, 0, 0, 0).unwrap();
+        assert!(transaction_windows(t, t).is_empty());
+        assert!(transaction_windows(t, t - Duration::days(1)).is_empty());
+    }
 }
